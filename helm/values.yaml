@@ -1,0 +1,17 @@
+
+httpPort: 1080  #apisix controller http listen port
+httpsPort: 1443 #apisix controller https listen port
+exposeMode: HostPort # enum [ LoadBalancer | HostPort | HostNetwork ]
+workerProcesses: 1
+replicas: 1
+resources:
+  requests:
+    cpu: "1000m"
+  limits:
+    cpu: "1000m"
+image:
+# nodeMatchExpressions:
+#   - key: kubernetes.io/hostname
+#     operator: In
+#     values:
+#       - node-172.16.0.238   

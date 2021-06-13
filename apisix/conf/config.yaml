@@ -1,0 +1,2 @@
+nginx_config:                     # config for render the template to generate nginx.conf
+  error_log_level: "info"

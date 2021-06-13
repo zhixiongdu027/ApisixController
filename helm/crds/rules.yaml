@@ -1,0 +1,228 @@
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: rules.apisix.apache.org
+spec:
+  conversion:
+    strategy: None
+  group: apisix.apache.org
+  names:
+    kind: Rule
+    listKind: RuleList
+    plural: rules
+    singular: rule
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            content:
+              type: object
+              properties:
+                routes:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        pattern: ^[a-zA-Z0-9-.]{1,64}$
+                      methods:
+                        type: array
+                        items:
+                          type: string
+                          enum: [ GET, POST, PUT, DELETE, PATCH, HEAD,OPTIONS, CONNECT, TRACE ]
+                      hosts:
+                        type: array
+                        items:
+                          type: string
+                          pattern: ^(\*.){0,1}([0-9a-zA-Z][0-9a-zA-Z-]{0,62}.){,4}[0-9a-zA-Z]{1,5}$
+                      uris:
+                        type: array
+                        items:
+                          type: string
+                          pattern: ^\S+$
+                        minItems: 1
+                      priority:
+                        type: integer
+                        default: 0
+                      enable_websocket:
+                        type: boolean
+                        default: false
+                      script:
+                        type: string
+                      vars:
+                        type: array
+                        items:
+                          type: array
+                          items:
+                            type: string
+                            maxLength: 120
+                          minItems: 3
+                      filter_func:
+                        type: string
+                        minLength: 10
+                        pattern: ^function
+                      plugins:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                      remote_addrs:
+                        type: array
+                        items:
+                          type: string
+                          anyOf:
+                            - format: ipv4
+                            - format: ipv6
+                            - format: cidr
+                      status:
+                        type: integer
+                        enum: [ 1, 0 ]
+                        default: 1
+                      upstream_id:
+                        type: string
+                        pattern: ^[a-zA-Z0-9-.]{1,64}$
+                      labels:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                    required: [ id,uris ]
+                    anyOf:
+                      - required: [ plugins ]
+                      - required: [ upstream_id ]
+                services:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        pattern: ^[a-zA-Z0-9-.]{1,64}$
+                      plugins:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                      upstream_id:
+                        type: string
+                        pattern: ^[a-zA-Z0-9-.]{1,64}$
+                      labels:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                      enable_websocket:
+                        type: boolean
+                        default: false
+                upstreams:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                        pattern: ^[a-zA-Z0-9-.]{1,64}$
+                      type:
+                        type: string
+                        enum: [ chash, roundrobin, ewma, least_conn ]
+                      hash_on:
+                        type: string
+                        enum: [ vars,header,cookie,consumer,vars_combinations ]
+                        default: vars
+                      key:
+                        type: string
+                      nodes:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            host:
+                              type: string
+                            port:
+                              type: integer
+                              minimum: 1
+                              maximum: 65535
+                            weight:
+                              type: integer
+                              default: 50
+                            priority:
+                              type: integer
+                              default: 0
+                            metadata:
+                              type: object
+                              x-kubernetes-preserve-unknown-fields: true
+                        required: [ host, port, weight ]
+                      service_name:
+                        type: string
+                      discovery_type:
+                        type: string
+                        enum: [ k8s ]
+                      scheme:
+                        type: string
+                        enum: [ http,https,grpc,grpcs ]
+                        default: http
+                      retries:
+                        type: integer
+                      timeout:
+                        type: object
+                        properties:
+                          connect:
+                            type: integer
+                          send:
+                            type: integer
+                          read:
+                            type: integer
+                        default:
+                          connect: 200
+                          send: 400
+                          read: 1200
+                      tls:
+                        type: object
+                        properties:
+                          client_cert:
+                            type: string
+                          client_key:
+                            type: string
+                      pass_host:
+                        type: string
+                        enum: [ pass,node,rewrite ]
+                        default: pass
+                      upstream_host:
+                        type: string
+                      labels:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                    required: [ id,type ]
+                    anyOf:
+                      - required: [ nodes ]
+                      - required: [ service_name,discovery_type ]
+                ssl:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      snis:
+                        type: array
+                        items:
+                          type: string
+                          parrern: ^(\*.){0,1}([0-9a-zA-Z][0-9a-zA-Z-]{0,62}.){1,4}[0-9a-zA-Z]{1,5}$
+                        minItems: 1
+                      cert:
+                        type: string
+                      key:
+                        type: string
+                      status:
+                        type: integer
+                        enum: [ 0,1 ]
+                        default: 1
+                      exptime:
+                        type: integer
+                        minimum: 1588262400 #2020/5/1 0:0:0
+                      validity_start:
+                        type: integer
+                      validity_end:
+                        type: integer
+                    required: [ snis,cert,key ]

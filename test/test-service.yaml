@@ -1,0 +1,83 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: config-yaml
+  namespace: test-apisix
+data:
+  config.yaml: |
+    apisix:
+      config_center: yaml
+      enable_admin: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: apisix-yaml
+  namespace: test-apisix
+data:
+  apisix.yaml: |
+    routes:
+      - id: test-route
+        uris: [ /* ]
+        plugins:
+          serverless-pre-function:
+            phase: access
+            functions :
+              - return function(conf, ctx) ngx.say(ctx.var._cache.uri); end
+    #END
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-service
+  namespace: test-apisix
+  labels:
+    app.kubernetes.io/name: test-service
+spec:
+  selector:
+    app.kubernetes.io/name: test-service
+  ports:
+    - name: http
+      port: 9080
+      protocol: TCP
+    - name: https
+      port: 9443
+      protocol: TCP
+  type: ClusterIP
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-service
+  namespace: test-apisix
+  labels:
+    app.kubernetes.io/name: test-service
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: test-service
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: test-service
+    spec:
+      volumes:
+        - name: apisix-yaml
+          configMap:
+            name: apisix-yaml
+        - name: config-yaml
+          configMap:
+            name: config-yaml
+      containers:
+        - name: apisix
+          image: apache/apisix:2.6-centos
+          env:
+            - name: APISIX_WORKER_PROCESSES
+              value: "1"
+          volumeMounts:
+            - name: apisix-yaml
+              mountPath: /usr/local/apisix/conf/apisix.yaml
+              subPath: apisix.yaml
+            - name: config-yaml
+              mountPath: /usr/local/apisix/conf/config.yaml
+              subPath: config.yaml

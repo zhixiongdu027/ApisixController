@@ -1,0 +1,15 @@
+apiVersion: apisix.apache.org/v1alpha1
+kind: Rule
+metadata:
+  name: test-route
+  namespace: test-apisix
+content:
+  routes:
+    - id: normal
+      uris: [ /normal* ]
+      upstream_id: normal
+  upstreams:
+    - id: normal
+      type: roundrobin
+      service_name: test-service:http
+      discovery_type: k8s

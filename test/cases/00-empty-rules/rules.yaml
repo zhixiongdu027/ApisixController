@@ -1,0 +1,6 @@
+apiVersion: apisix.apache.org/v1alpha1
+kind: Rule
+metadata:
+  name: test-route
+  namespace: test-apisix
+content: {}
