@@ -1,14 +1,13 @@
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: apisix-controller
+  name: {{.Values.name}}-apisix-controller
   namespace: {{.Release.Namespace}}
 ---
-kind: Role
+kind: ClusterRole
 apiVersion: rbac.authorization.k8s.io/v1
 metadata:
-  name: apisix-controller
-  namespace: {{.Release.Namespace}}
+  name: {{.Values.name}}-apisix-controller
 rules:
   - apiGroups: [ "" ]
     resources: [ endpoints ]
@@ -21,37 +20,52 @@ rules:
     verbs: [ get,list,watch ]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
+kind: ClusterRoleBinding
 metadata:
-  name: apisix-controller
+  name: {{.Values.name}}-apisix-controller
   namespace: {{.Release.Namespace}}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: apisix-controller
+  kind: ClusterRole
+  name: {{.Values.name}}-apisix-controller
 subjects:
   - kind: ServiceAccount
-    name: apisix-controller
+    name: {{.Values.name}}-apisix-controller
+    namespace: {{.Release.Namespace}}
 ---
 apiVersion: v1
 kind: Service
 metadata:
   labels:
-    app.kubernetes.io/part-of: apisix-controller
+    app.kubernetes.io/name: {{.Values.name}}-apisix-controller
   namespace: {{.Release.Namespace}}
-  name: apisix-controller
+  name: {{.Values.name}}-apisix-controller
 spec:
   ports:
+    - name: webhook
+      port: 65443
     - name: http
+      {{- if eq .Values.exposeMode "HostNetwork"}}
+      port: 9080
+      {{- else if eq .Values.exposeMode "HostPort"}}
       port: {{.Values.httpPort}}
+      {{- else if eq .Values.exposeMode "LoadBalancer"}}
+      port: {{.Values.httpPort}}
+      {{- end }}
       protocol: TCP
-      targetPort: 80
+      targetPort: 9080
     - name: https
+      {{- if eq .Values.exposeMode "HostNetwork"}}
+      port: 9443
+      {{- else if eq .Values.exposeMode "HostPort"}}
       port: {{.Values.httpsPort}}
+      {{- else if eq .Values.exposeMode "LoadBalancer"}}
+      port: {{.Values.httpsPort}}
+      {{- end }}
       protocol: TCP
-      targetPort: 443
+      targetPort: 9443
   selector:
-    app.kubernetes.io/name: apisix-controller
+    app.kubernetes.io/name: {{.Values.name}}-apisix-controller
   sessionAffinity: None
   {{- if eq .Values.exposeMode "LoadBalancer" }}
   type: LoadBalancer
@@ -63,8 +77,8 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   labels:
-    app.kubernetes.io/part-of: apisix-controller
-  name: apisix-controller
+    app.kubernetes.io/name: {{.Values.name}}-apisix-controller
+  name: {{.Values.name}}-apisix-controller
   namespace: {{.Release.Namespace}}
 spec:
   {{- if .Release.IsInstall}}
@@ -72,7 +86,7 @@ spec:
   {{- end}}
   selector:
     matchLabels:
-      app.kubernetes.io/name: apisix-controller
+      app.kubernetes.io/name: {{.Values.name}}-apisix-controller
   strategy:
     rollingUpdate:
       maxSurge: 25%
@@ -81,8 +95,8 @@ spec:
   template:
     metadata:
       labels:
-        app.kubernetes.io/name: apisix-controller
-      name: apisix-controller
+        app.kubernetes.io/name: {{.Values.name}}-apisix-controller
+      name: {{.Values.name}}-apisix-controller
       namespace: {{.Release.Namespace}}
     spec:
       {{- if .Values.nodeMatchExpressions }}
@@ -108,14 +122,17 @@ spec:
       {{- end }}
       enableServiceLinks: false
       restartPolicy: Always
-      serviceAccount: apisix-controller
-      serviceAccountName: apisix-controller
+      serviceAccount: {{.Values.name}}-apisix-controller
+      serviceAccountName: {{.Values.name}}-apisix-controller
       {{/*      readinessGates:*/}}
       {{/*        - conditionType: "controller"*/}}
       volumes:
         - name: config-mount
           configMap:
-            name: apisix-controller
+            name: {{.Values.name}}-apisix-controller
+        - name: cert-mount
+          secret:
+            secretName: {{.Values.name}}-apisix-controller-cert
       containers:
         - name: apisix-controller
           image: {{.Values.image}}
@@ -127,13 +144,15 @@ spec:
             - name: config-mount
               mountPath: /usr/local/apisix/conf/config-default.yaml
               subPath: config-default.yaml
+            - name: cert-mount
+              mountPath: /usr/local/apisix/conf/cert/webhook
           {{- if eq .Values.exposeMode "HostPort" }}
           ports:
-            - containerPort: 80
+            - containerPort: 9080
               hostPort: {{.Values.httpPort}}
               name: http
               protocol: TCP
-            - containerPort: 443
+            - containerPort: 9443
               hostPort: {{.Values.httpsPort}}
               name: https
               protocol: TCP
@@ -142,9 +161,10 @@ spec:
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: apisix-controller
+  name: {{.Values.name}}-apisix-controller
+  namespace: {{.Release.Namespace}}
   labels:
-    app.kubernetes.io/part-of: apisix-controller
+    app.kubernetes.io/part-of: {{.Values.name}}-apisix-controller
 data:
   config-default.yaml: |+
     #
@@ -169,7 +189,7 @@ data:
     #
 
     apisix:
-      node_listen: 80             # APISIX listening port
+      node_listen: 9080             # APISIX listening port
       enable_admin: false
       enable_admin_cors: true          # Admin API support CORS response headers.
       enable_debug: false
@@ -261,7 +281,7 @@ data:
       ssl:
         enable: true
         enable_http2: true
-        listen_port: 443
+        listen_port: 9443
           #ssl_trusted_certificate: /path/to/ca-cert  # Specifies a file path with trusted CA certificates in the PEM format
           # used to verify the certificate when APISIX needs to do SSL/TLS handshaking
         # with external services (e.g. etcd)
@@ -459,3 +479,5 @@ data:
         report_ttl: 3600     # live time for server info in etcd (unit: second)
       dubbo-proxy:
         upstream_multiplex_count: 32
+      controller:
+        name: {{.Values.name}}

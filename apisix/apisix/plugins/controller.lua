@@ -16,38 +16,39 @@ local profile = require("apisix.core.profile")
 local apisix_yaml_path = profile:yaml_path("apisix")
 local lyaml = require "lyaml"
 
-local namespace = ""
 local token = ""
 local apiserver_host = ""
 local apiserver_port = ""
+local controller_name = ""
 
-local dump_cache = {
-    -- routes = {},
-    -- upstreams = {},
-    -- services = {},
-    -- ssl = {}
-}
+local dump_cache = {}
 
 local function end_world(reason)
     core.log.emerg(reason)
-    -- signal.kill(process.get_master_pid(), signal.signum("QUIT"))
+    signal.kill(process.get_master_pid(), signal.signum("QUIT"))
 end
 
 local function dump_yaml(resource)
     -- todo delay 0.5 second to write
     core.table.clear(dump_cache)
     resource:dump_callback(dump_cache)
-    local yamlstr = lyaml.dump({dump_cache})
+    local yaml = lyaml.dump({ dump_cache })
     local file, err = open(apisix_yaml_path, "w+")
     if not file then
         core.log.emerg("open file: ", apisix_yaml_path .. " failed , error info:" .. err)
     end
-    file:write(string.sub(yamlstr, 1, -5))
+    file:write(string.sub(yaml, 1, -5))
     file:write("#END")
     file:close()
 end
 
 local function event_dispatch(resource, event, object, drive)
+
+    if event == "BOOKMARK" then
+        -- do nothing because we had record max_resource_version to resource.max_resource_version
+        return
+    end
+
     if drive == "watch" then
         local resource_version = object.metadata.resourceVersion
         local rvv = tonumber(resource_version)
@@ -57,19 +58,32 @@ local function event_dispatch(resource, event, object, drive)
         resource.max_resource_version = rvv
     end
 
+    if (object.content.routes) then
+        for _, v in ipairs(object.content.routes) do
+            if not v.labels then
+                v.labels = { namespace = object.metadata.namespace }
+            else
+                v.labels.namespace = object.metadata.namespace
+            end
+        end
+    end
+
+    if (object.content.upstreams) then
+        for _, v in ipairs(object.content.upstreams) do
+            if v.service_name and v.discovery_type == "k8s" then
+                v.service_name = object.metadata.namespace .. "/" .. v.service_name
+            end
+        end
+    end
+
     if event == "ADDED" then
         resource:added_callback(object, drive)
-    elseif event == "MODIFIED" then
-        if object.deletionTimestamp ~= nil then
-            resource:deleted_callback(object)
-        else
-            resource:modified_callback(object)
-        end
-    elseif event == "DELETED" then
+    elseif event == "MODIFIED" and object.deletionTimestamp == nil then
+        resource:modified_callback(object)
+    else
         resource:deleted_callback(object)
-    elseif event == "BOOKMARK" then
-        -- do nothing because we had record max_resource_version to resource.max_resource_version
     end
+
     if drive == "watch" then
         dump_yaml(resource)
     end
@@ -79,7 +93,7 @@ local function list_resource(httpc, resource, continue)
     httpc:set_timeouts(2000, 2000, 3000)
     local res, err = httpc:request({
         path = resource:list_path(),
-        query = resource:list_query(),
+        query = resource:list_query(continue),
         headers = {
             ["Authorization"] = string.format("Bearer %s", token)
         }
@@ -201,26 +215,33 @@ local function fetch()
         storage = {},
         list_storage = {},
         max_resource_version = 0,
-        watch_state = "ｕninitialized",
+        watch_state = "uninitialized",
+
+        label_selector = function()
+            if controller_name == "default" then
+                return "&labelSelector=apisix.apache.org%2Fcontroller-by+in+%28%2C" .. controller_name .. "%29"
+            end
+            return "&labelSelector=apisix.apache.org%2Fcontroller-by%3D" .. controller_name
+        end,
+
         list_path = function(self)
-            return string.format("/apis/apisix.apache.org/v1alpha1/namespaces/%s/rules", namespace)
+            return "/apis/apisix.apache.org/v1alpha1/rules"
         end,
 
         list_query = function(self, continue)
             if continue == nil or continue == "" then
-                return "limit=10"
+                return "limit=30" .. self.label_selector()
             else
-                return "limit=10&continue=" .. continue
+                return "limit=30&continue=" .. continue .. self.label_selector()
             end
         end,
 
         watch_path = function(self)
-            return string.format("/apis/apisix.apache.org/v1alpha1/namespaces/%s/rules", namespace)
+            return "/apis/apisix.apache.org/v1alpha1/rules"
         end,
 
         watch_query = function(self, timeout)
-            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout,
-                self.max_resource_version)
+            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout, self.max_resource_version) .. self.label_selector()
         end,
 
         pre_list_callback = function(self)
@@ -253,7 +274,7 @@ local function fetch()
                 for k2, v2 in pairs(v1) do
                     for _, v3 in pairs(v2) do
                         if t[k2] == nil then
-                            t[k2] = {v3}
+                            t[k2] = { v3 }
                         else
                             core.table.insert(t[k2], v3)
                         end
@@ -280,7 +301,7 @@ local function fetch()
             if not ok then
                 resource.watch_state = "connecting"
                 core.log.error("connect apiserver failed , apiserver_host: ", apiserver_host, "apiserver_port",
-                    apiserver_port, "message : ", message)
+                        apiserver_port, "message : ", message)
                 intervalTime = 200
                 break
             end
@@ -323,7 +344,7 @@ local schema = {
 
 local _M = {
     version = 0.1,
-    priority = 999,
+    priority = 99,
     name = plugin_name,
     schema = schema
 }
@@ -337,17 +358,16 @@ function _M.init()
         return
     end
 
-    local err
-    namespace, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-    if not namespace or namespace == "" then
-        end_world("get empty namespace value " .. (err or ""))
-        return
+    local local_conf = core.config.local_conf()
+
+    local controller_conf = core.table.try_read_attr(local_conf, "plugin_attr",
+            "controller")
+    if controller_conf then
+        controller_name = controller_conf.name
     end
 
-    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
-    if not token or token == "" then
-        end_world("get empty token value " .. (err or ""))
-        return
+    if not controller_name or controller_name == "" then
+        end_world("get empty controller_name value")
     end
 
     apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
@@ -360,13 +380,14 @@ function _M.init()
         end_world("get empty KUBERNETES_SERVICE_PORT value")
     end
 
-    ngx_timer_at(0, fetch)
-
-    return function(conf, ctx)
-        ngx.say("uri", ":", ctx.var._cache.uri);
-        return 200;
+    local err
+    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    if not token or token == "" then
+        end_world("get empty token value " .. (err or ""))
+        return
     end
 
+    ngx_timer_at(0, fetch)
 end
 
 return _M

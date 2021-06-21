@@ -1,2 +1,32 @@
-nginx_config:                     # config for render the template to generate nginx.conf
+# Configuration File - Apisix Config File
+# Modify it may be cause
+apisix:
+  config_center: yaml
+  enable_admin: false
+nginx_config:
   error_log_level: "info"
+  http_configuration_snippet: |
+    ##### do not edit this section, unless you know what you're doing #####
+     server {
+             listen 65443 ssl;
+
+             ssl_certificate      /usr/local/apisix/conf/cert/webhook/tls.crt;
+             ssl_certificate_key  /usr/local/apisix/conf/cert/webhook/tls.key;
+             ssl_session_cache    shared:SSL:20m;
+             ssl_session_timeout 10m;
+
+             ssl_protocols TLSv1.2 TLSv1.3;
+             ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+             ssl_prefer_server_ciphers on;
+             ssl_session_tickets off;
+
+             lua_need_request_body on;
+
+             location = /validating/apisix.apache.org/rules/v1alpha1 {
+                 content_by_lua_block {
+                     local webhook = require("apisix.plugins.webhook")
+                     webhook.validating()
+                 }
+             }
+         }
+    ##### do not edit this section, unless you know what you're doing ####

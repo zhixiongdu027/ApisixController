@@ -23,6 +23,17 @@ spec:
             content:
               type: object
               properties:
+                global_rules:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      id:
+                        type: string
+                      plugins:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
                 routes:
                   type: array
                   items:
@@ -90,7 +101,7 @@ spec:
                         type: object
                         additionalProperties:
                           x-kubernetes-preserve-unknown-fields: true
-                    required: [ id,uris ]
+                    required: [ id, uris ]
                     anyOf:
                       - required: [ plugins ]
                       - required: [ upstream_id ]
@@ -161,7 +172,7 @@ spec:
                         enum: [ k8s ]
                       scheme:
                         type: string
-                        enum: [ http,https,grpc,grpcs ]
+                        enum: [ http, https, grpc, grpcs ]
                         default: http
                       retries:
                         type: integer
@@ -187,7 +198,7 @@ spec:
                             type: string
                       pass_host:
                         type: string
-                        enum: [ pass,node,rewrite ]
+                        enum: [ pass, node, rewrite ]
                         default: pass
                       upstream_host:
                         type: string
@@ -195,10 +206,11 @@ spec:
                         type: object
                         additionalProperties:
                           x-kubernetes-preserve-unknown-fields: true
-                    required: [ id,type ]
-                    anyOf:
+                    required: [ id, type ]
+                    oneOf:
                       - required: [ nodes ]
-                      - required: [ service_name,discovery_type ]
+                      - required: [ service_name, discovery_type ]
+                  minItems: 1
                 ssl:
                   type: array
                   items:
@@ -216,13 +228,39 @@ spec:
                         type: string
                       status:
                         type: integer
-                        enum: [ 0,1 ]
+                        enum: [ 0, 1 ]
                         default: 1
                       exptime:
                         type: integer
-                        minimum: 1588262400 #2020/5/1 0:0:0
+                        minimum: 1588262400             #2020/5/1 0:0:0
                       validity_start:
                         type: integer
                       validity_end:
                         type: integer
-                    required: [ snis,cert,key ]
+                    required: [ snis, cert, key ]
+                  minItems: 1
+                consumers:
+                  type: array
+                  items:
+                    type: object
+                    properties:
+                      username:
+                        type: string
+                        pattern: ^[a-zA-Z0-9_]+$
+                        minLength: 1
+                        maxLength: 32
+                      plugins:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                      labels:
+                        type: object
+                        additionalProperties:
+                          x-kubernetes-preserve-unknown-fields: true
+                    required: [ username ]
+              anyOf:
+                - required: [ routes ]
+                - required: [ services ]
+                - required: [ upstreams ]
+                - required: [ ssl ]
+          required: [ content ]

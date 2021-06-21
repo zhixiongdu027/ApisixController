@@ -3,6 +3,8 @@ kind: Rule
 metadata:
   name: test-route
   namespace: test-apisix
+  labels:
+    apisix.apache.org/controller-by: default
 content:
   routes:
     - id: normal

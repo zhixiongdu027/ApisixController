@@ -67,21 +67,23 @@ local function on_endpoint_added(endpoint)
         cache_table[port.name] = nodes
     end
 
+    local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
     local _, err
-    _, err = shared_endpoints:safe_set(endpoint.metadata.name .. "#version", endpoint.metadata.resourceVersion)
+    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint.metadata.resourceVersion)
     if err then
         core.log.emerg("set endpoint version into discovery DICT failed ,", err)
     end
 
-    shared_endpoints:safe_set(endpoint.metadata.name, core.json.encode(cache_table, true))
+    shared_endpoints:safe_set(endpoint_key, core.json.encode(cache_table, true))
     if err then
         core.log.emerg("set endpoint into discovery DICT failed ,", err)
     end
 end
 
 local function on_endpoint_deleted(endpoint)
-    shared_endpoints:delete(endpoint.metadata.name .. "#version")
-    shared_endpoints:delete(endpoint.metadata.name)
+    local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
+    shared_endpoints:delete(endpoint_key .. "#version")
+    shared_endpoints:delete(endpoint_key)
 end
 
 local function on_endpoint_modified(endpoint)
@@ -116,19 +118,25 @@ local function on_endpoint_modified(endpoint)
         cache_table[port.name] = nodes
     end
 
+    local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
     local _, err
-    _, err = shared_endpoints:safe_set(endpoint.metadata.name .. "#version", endpoint.metadata.resourceVersion)
+    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint.metadata.resourceVersion)
     if err then
         core.log.emerg("set endpoints version into discovery DICT failed ,", err)
     end
 
-    shared_endpoints:safe_set(endpoint.metadata.name, core.json.encode(cache_table, true))
+    shared_endpoints:safe_set(endpoint_key, core.json.encode(cache_table, true))
     if err then
         core.log.emerg("set endpoints into discovery DICT failed ,", err)
     end
 end
 
 local function event_dispatch(resource, event, object, drive)
+    if event == "BOOKMARK" then
+        -- do nothing because we had record max_resource_version to resource.max_resource_version
+        return
+    end
+
     if drive == "watch" then
         local resource_version = object.metadata.resourceVersion
         local rvv = tonumber(resource_version)
@@ -140,16 +148,10 @@ local function event_dispatch(resource, event, object, drive)
 
     if event == "ADDED" then
         resource:added_callback(object, drive)
-    elseif event == "MODIFIED" then
-        if object.deletionTimestamp ~= nil then
-            resource:deleted_callback(object)
-        else
-            resource:modified_callback(object)
-        end
-    elseif event == "DELETED" then
+    elseif event == "MODIFIED" and object.deletionTimestamp == nil then
+        resource:modified_callback(object)
+    else
         resource:deleted_callback(object)
-    elseif event == "BOOKMARK" then
-        -- do nothing because we had record max_resource_version to resource.max_resource_version
     end
 end
 
@@ -278,7 +280,7 @@ local function fetch()
         max_resource_version = 0,
 
         list_path = function(self)
-            return string.format("/api/v1/namespaces/%s/endpoints", namespace)
+            return string.format("/api/v1/endpoints", namespace)
         end,
 
         list_query = function(self, continue)
@@ -295,7 +297,7 @@ local function fetch()
 
         watch_query = function(self, timeout)
             return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout,
-                self.max_resource_version)
+                    self.max_resource_version)
         end,
 
         pre_list_callback = function(self)
@@ -337,7 +339,7 @@ local function fetch()
             if not ok then
                 resource.watch_state = "connecting"
                 core.log.error("connect apiserver failed , apiserver_host: ", apiserver_host, "apiserver_port",
-                    apiserver_port, "message : ", message)
+                        apiserver_port, "message : ", message)
                 intervalTime = 200
                 break
             end
@@ -371,10 +373,10 @@ local function fetch()
     end
 end
 
-local function create_lrucache(service_name, port_name)
-    local endpoint, _, _ = shared_endpoints:get_stale(service_name)
+local function create_lrucache(endpoint_key, endpoint_port)
+    local endpoint, _, _ = shared_endpoints:get_stale(endpoint_key)
     if not endpoint then
-        core.log.error("get emppty endpoint from discovery DICT,this should not happen ", service_name)
+        core.log.error("get emppty endpoint from discovery DICT,this should not happen ", endpoint_key)
         return nil
     end
 
@@ -382,7 +384,7 @@ local function create_lrucache(service_name, port_name)
     if not t then
         core.log.error("decode endpoint failed, this should not happen, content : ", endpoint)
     end
-    return t[port_name]
+    return t[endpoint_port]
 end
 
 local _M = {
@@ -390,20 +392,20 @@ local _M = {
 }
 
 function _M.nodes(service_name)
-    local pattern = "([a-z][a-z0-9-.]{0,62})[:]([a-z][a-z0-9-.]{0,62})$"
+    local pattern = "^(.*):(.*)$"
     local match, _ = ngx.re.match(service_name, pattern, "jiao")
     if not match then
         core.log.info("get ｕnexpected upstream service_name:　", service_name)
         return nil
     end
-    local k8s_service_name = match[1]
-    local k8s_port_name = match[2]
-    local version, _, _ = shared_endpoints:get_stale(k8s_service_name .. "#version")
+    local endpoint_key = match[1]
+    local endpoins_port = match[2]
+    local version, _, _ = shared_endpoints:get_stale(endpoint_key .. "#version")
     if not version then
-        core.log.info("get emppty endpoint version from discovery DICT ", k8s_service_name)
+        core.log.info("get emppty endpoint version from discovery DICT ", endpoint_key)
         return nil
     end
-    return lrucache(service_name, version, create_lrucache, k8s_service_name, k8s_port_name)
+    return lrucache(service_name, version, create_lrucache, endpoint_key, endpoins_port)
 end
 
 function _M.init_worker()

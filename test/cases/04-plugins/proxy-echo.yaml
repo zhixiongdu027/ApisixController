@@ -8,7 +8,13 @@ metadata:
 content:
   routes:
     - id: normal
-      uris: [ /normal* ]
+      uris: [ "/normal","/normal/*" ]
+      plugins:
+        proxy-rewrite:
+          regex_uri: [ "^/normal(.*)"  , "/$1" ]
+          host: newhost.com
+        echo:
+          before_body: "append by echo"
       upstream_id: normal
   upstreams:
     - id: normal

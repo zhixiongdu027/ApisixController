@@ -1,6 +1,6 @@
-
-httpPort: 1080  #apisix controller http listen port
-httpsPort: 1443 #apisix controller https listen port
+name: default
+httpPort: 9080  #Apisix controller http listen port
+httpsPort: 9443 #Apisix controller https listen port
 exposeMode: HostPort # enum [ LoadBalancer | HostPort | HostNetwork ]
 workerProcesses: 1
 replicas: 1

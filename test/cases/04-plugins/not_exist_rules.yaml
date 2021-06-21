@@ -9,9 +9,7 @@ content:
   routes:
     - id: normal
       uris: [ /normal* ]
-      upstream_id: normal
-  upstreams:
-    - id: normal
-      type: roundrobin
-      service_name: test-service:http
-      discovery_type: k8s
+      plugins:
+        not_exist_plugin:
+          a: 3
+          b: 2

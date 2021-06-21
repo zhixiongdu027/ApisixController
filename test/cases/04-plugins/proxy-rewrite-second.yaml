@@ -8,7 +8,11 @@ metadata:
 content:
   routes:
     - id: normal
-      uris: [ /normal* ]
+      uris: [ "/second","/second/*" ]
+      plugins:
+        proxy-rewrite:
+          regex_uri: [ "^/second(.*)"  , "/$1" ]
+          host: newhost.com
       upstream_id: normal
   upstreams:
     - id: normal

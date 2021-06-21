@@ -8,10 +8,14 @@ metadata:
 content:
   routes:
     - id: normal
-      uris: [ /normal* ]
+      uris: [ "/first","/first/*" ]
+      plugins:
+        proxy-rewrite:
+          regex_uri: [ "^/first(.*)"  , "/$1" ]
       upstream_id: normal
   upstreams:
     - id: normal
       type: roundrobin
       service_name: test-service:http
       discovery_type: k8s
+
