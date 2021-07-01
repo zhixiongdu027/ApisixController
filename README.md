@@ -1,77 +1,76 @@
-# ApisixController
+# ApisixTinyController
 
-```text
-  本项目是以 apisix 为底层代理的一种 K8S Ingress Controller 实现
-  
-  但本项目并不会支持
-   networking.k8s.io/v1.ingress
-   networking.k8s.io/v1beta1.ingress
-   extensions/v1beta1.ingress
+**ApisixTinyController** 是以 **Apache APISIX** 为底层代理的一种轻量,精简但能全面释放 **Apache APISIX** 能力的 K8S Ingress Controller 实现
+
+## 特性
+
+**ApisixTinyController** 不支持:
+
++ networking.k8s.io/v1.ingress
++ networking.k8s.io/v1beta1.ingress
++ extensions/v1beta1.ingress
+
+原因是 **Ingress** 定义太过简陋以至于任何一个实际生产使用的 **Ingress Controller** 需要定义大量私有注解. 私有注解又使得**K8S Ingress** 丧失了统一性,移植性优势,进一步消解了 **
+Ingress** 的价值. 作者认为支持 **Ingress** 只是**政治正确**.
+
+**ApisixTinyController** 使用 **K8S CRD** 作为用户配置路由,证书,服务地址入口.
+
+## 优势
+
+**ApisixTinyController** 的优势为:
+1. 实现精简,仅有三个实现文件
+   + discovery/k8s.lua
+   + plugins/controller.lua
+   + plugins/webhook.lua 
    
-  原因是 Ingress 定义的太简陋,以致于所有的 IngressController 都需要额外添加大量的注解才能实际投入使用.
-  但注解规则与 IngressController 的绑定又背离的Ingress 的抽象目标.
+2. CRD schema 与 **Apache APISIX** Schema 一一对应,带来了使用上的优势
+   + 可以将 **Apache APISIX** 完整(stand_alone 模式支持的)能力复制到 **ApisixTinyController**
+   + 可以兼容任何自研/第三方 **Apache APISIX** 插件
+   + 可以校验任何自研/第三方 **Apache APISIX** 插件配置
+
+## 实现
+
+**ApisixTinyController** 的核心逻辑
+
+### controller.lua
+```text
+  controller 通过 k8s apiserver 监听:
+    apisix.apache.org/rules
+    apisix.apache.org/configs
+    apisix.apache.org/certs
+  的实时变动,并将完整信息写入　conf/apisix.yaml文件
+  worker 进程会定时主动读取 conf/apisix.yaml,实现路由规则,插件,证书的热更新
   
-  本项目也需要定义 CRD,但其特点在于 CRD 是又 Apisix Stand Alone 模式下的 Apisix.yaml　配置格式
-  对应转换而来.
-  这样,任何能在 Apisix.yaml(Apisix Stand-Alone模式)中定义的的规则,都可以通过在 K8S 中资源中原样定义．
-  
-  其优点:
-   1. 不需要用户理解任何额外的注解规则
-　　2. 能完全复用 Apisix 能力,包括自定义开发的插件
+  controller.lua 只会由特权进程启动.
 ```
 
-# 项目实现
+### k8s.lua
+```text
+  k8s.lua 与其他 discovery 插件一样,用于在k8s运行环境中动态发现后端节点,并为work进程提供查询接口.
+  k8s.lua 通过 k8s apiserver 监听 endpoints 的实时变动,并将信息写入 lua shared DICT
+  k8s.lua 提供 nodes(service_name) 接口供工作线程查询后端节点(nodes)
+ 
+  k8s.lua 只会在特权进程启动监听, 在Work进程只提供查询功能
+```
 
-项目功能由两个文件实现:
-
-## k8s.lua
-
-  ```text
-  k8s.lua 与　apisix 的其他 discovery 插件一样,用于在 k8s运行环境中动态发现后端节点．
-  
-  其实现原理是由任务线程　list-watch  k8s v1.endpoints, 并将其变换信息写入 ngx.shared.discovery 中,
-  并提供　nodes(service_name) 函数供　工作线程查询后端节点(nodes)
-  
-  k8s.lua 要求 service_name 格式为 [k8s service name]:[k8s service port name]
-  ```
-
-## controller.lua
-
- ```text
-  controller.lua 只会由特权进程启动．
-  其实现原理是由任务线程　list-watch k8s apisix.apache.org/v1alpha1.rules ,并将其变换信息写入　conf/apisix.yaml 文件,
-  其他 worker 进程会定时主动读取 apisix.yaml,实现路由规则,插件的热更新
- ```
-
-# CRD
-
- ```text
-  crd 由 helm/crds/rules.yaml 文件描述
- ```
-
-# 使用
-
-## 准备
-
-+ 安装 docker ,helm3, kubect
-+ 准备可用的镜像仓库
-
-## 安装
-
-  ```shell
-    make install hub=${HubAddress}
-  ```
+### webhook.lua
+```text
+  webhook.lua 在每个 work 进程提供了一个 http handle,用于校验 crd 对象 ,包括 crd 对象包含的 plugin config
+  webhook.lua 提供的 handle 服务使用独立于业务服务端口,不会影响到业务服务.
+```
 
 ## 测试
+### 准备
+   + 安装 docker ,helm3, kubectl
+   + 安装 minikube用于模拟 k8s 集群 
+   + 可用的镜像仓库
 
-  ```shell
-    #测试需要安装 minikube ,用于模拟 k8s 集群
-    
+### 执行
+ ```shell
     make test hub=${HubAddress}
-  ```
+ ```
 
 # Todo List
-1. 实现 webhooks
-2. 补全 CRD 定义,包括 global_rules, plugins 等
-3. 测试用例
-4. 文档
+1. 测试用例
+2. 文档
+3. Bug检测
