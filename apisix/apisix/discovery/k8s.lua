@@ -2,6 +2,7 @@ local ipairs = ipairs
 local ngx = ngx
 local string = string
 local tonumber = tonumber
+local tostring = tostring
 local math = math
 local os = os
 local process = require("ngx.process")
@@ -9,22 +10,22 @@ local core = require("apisix.core")
 local util = require("apisix.cli.util")
 local http = require("resty.http")
 local signal = require("resty.signal")
-local ngx_timer_at = ngx.timer.at
-local shared_endpoints = ngx.shared.discovery
+local shared_endpoints = ngx.shared.discovery or ngx.shared.stream_discovery
 
+local token = ""
 local apiserver_host = ""
 local apiserver_port = ""
-local namespace = ""
-local token = ""
 
 local default_weight = 50
 
-local lrucache = core.lrucache.new({
+local endpoint_lrucache = core.lrucache.new({
     ttl = 300,
     count = 1024
 })
 
-local cache_table = {}
+local endpoint_buff = {}
+
+local watching_resources
 
 local function end_world(reason)
     core.log.emerg(reason)
@@ -53,7 +54,7 @@ local function on_endpoint_added(endpoint)
         return
     end
 
-    core.table.clear(cache_table)
+    core.table.clear(endpoint_buff)
     for _, port in ipairs(ports) do
         local nodes = core.table.new(#addresses, 0)
         for i, address in ipairs(addresses) do
@@ -64,19 +65,27 @@ local function on_endpoint_added(endpoint)
             }
         end
         core.table.sort(nodes, sort_by_key_host)
-        cache_table[port.name] = nodes
+        if port.name then
+            endpoint_buff[port.name] = nodes
+        else
+            endpoint_buff[tostring(port.port)] = nodes
+        end
     end
 
     local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
+    local endpoint_content = core.json.encode(endpoint_buff, true)
+    local endpoint_version = ngx.crc32_long(endpoint_content)
+
     local _, err
-    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint.metadata.resourceVersion)
+    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint_version)
     if err then
         core.log.emerg("set endpoint version into discovery DICT failed ,", err)
+        return
     end
-
-    shared_endpoints:safe_set(endpoint_key, core.json.encode(cache_table, true))
+    shared_endpoints:safe_set(endpoint_key, endpoint_content)
     if err then
         core.log.emerg("set endpoint into discovery DICT failed ,", err)
+        shared_endpoints:delete(endpoint_key .. "#version")
     end
 end
 
@@ -104,7 +113,7 @@ local function on_endpoint_modified(endpoint)
         return on_endpoint_deleted(endpoint)
     end
 
-    core.table.clear(cache_table)
+    core.table.clear(endpoint_buff)
     for _, port in ipairs(ports) do
         local nodes = core.table.new(#addresses, 0)
         for i, address in ipairs(addresses) do
@@ -115,43 +124,27 @@ local function on_endpoint_modified(endpoint)
             }
         end
         core.table.sort(nodes, sort_by_key_host)
-        cache_table[port.name] = nodes
+        if port.name then
+            endpoint_buff[port.name] = nodes
+        else
+            endpoint_buff[tostring(port.port)] = nodes
+        end
     end
 
     local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
+    local endpoint_content = core.json.encode(endpoint_buff, true)
+    local endpoint_version = ngx.crc32_long(endpoint_content)
+
     local _, err
-    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint.metadata.resourceVersion)
+    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint_version)
     if err then
-        core.log.emerg("set endpoints version into discovery DICT failed ,", err)
-    end
-
-    shared_endpoints:safe_set(endpoint_key, core.json.encode(cache_table, true))
-    if err then
-        core.log.emerg("set endpoints into discovery DICT failed ,", err)
-    end
-end
-
-local function event_dispatch(resource, event, object, drive)
-    if event == "BOOKMARK" then
-        -- do nothing because we had record max_resource_version to resource.max_resource_version
+        core.log.emerg("set endpoint version into discovery DICT failed ,", err)
         return
     end
-
-    if drive == "watch" then
-        local resource_version = object.metadata.resourceVersion
-        local rvv = tonumber(resource_version)
-        if rvv <= resource.max_resource_version then
-            return
-        end
-        resource.max_resource_version = rvv
-    end
-
-    if event == "ADDED" then
-        resource:added_callback(object, drive)
-    elseif event == "MODIFIED" and object.deletionTimestamp == nil then
-        resource:modified_callback(object)
-    else
-        resource:deleted_callback(object)
+    shared_endpoints:safe_set(endpoint_key, endpoint_content)
+    if err then
+        core.log.emerg("set endpoint into discovery DICT failed ,", err)
+        shared_endpoints:delete(endpoint_key .. "#version")
     end
 end
 
@@ -159,7 +152,7 @@ local function list_resource(httpc, resource, continue)
     httpc:set_timeouts(2000, 2000, 3000)
     local res, err = httpc:request({
         path = resource:list_path(),
-        query = resource:list_query(),
+        query = resource:list_query(continue),
         headers = {
             ["Authorization"] = string.format("Bearer %s", token)
         }
@@ -170,7 +163,7 @@ local function list_resource(httpc, resource, continue)
     end
 
     if res.status ~= 200 then
-        return false, res.reason, res.read_body() or ""
+        return false, res.reason, res:read_body() or ""
     end
 
     local body, err = res:read_body()
@@ -187,7 +180,7 @@ local function list_resource(httpc, resource, continue)
     resource.max_resource_version = tonumber(resource_version)
 
     for _, item in ipairs(data.items) do
-        event_dispatch(resource, "ADDED", item, "list")
+        resource:event_dispatch("ADDED", item, "list")
     end
 
     if data.metadata.continue ~= nil and data.metadata.continue ~= "" then
@@ -215,15 +208,15 @@ local function watch_resource(httpc, resource)
     end
 
     if res.status ~= 200 then
-        return false, res.reason, res.read_body and res.read_body()
+        return false, res.reason, res:read_body() or ""
     end
 
-    local remaindBody = ""
+    local remainder_body = ""
     local body = ""
     local reader = res.body_reader
-    local gmatchIterator;
+    local gmatch_iterator;
     local captures;
-    local capturedSize = 0
+    local captured_size = 0
     while true do
 
         body, err = reader()
@@ -235,52 +228,183 @@ local function watch_resource(httpc, resource)
             break
         end
 
-        if #remaindBody ~= 0 then
-            body = remaindBody .. body
+        if #remainder_body ~= 0 then
+            body = remainder_body .. body
         end
 
-        gmatchIterator, err = ngx.re.gmatch(body, "{\"type\":.*}\n", "jiao")
-        if not gmatchIterator then
+        gmatch_iterator, err = ngx.re.gmatch(body, "{\"type\":.*}\n", "jiao")
+        if not gmatch_iterator then
             return false, "GmatchError", err
         end
 
         while true do
-            captures, err = gmatchIterator()
+            captures, err = gmatch_iterator()
             if err then
                 return false, "GmatchError", err
             end
             if not captures then
                 break
             end
-            capturedSize = capturedSize + #captures[0]
+            captured_size = captured_size + #captures[0]
             local v, _ = core.json.decode(captures[0])
             if not v or not v.object or v.object.kind ~= resource.kind then
                 return false, "UnexpectedBody", captures[0]
             end
-            event_dispatch(resource, v.type, v.object, "watch")
+            resource:event_dispatch(v.type, v.object, "watch")
         end
 
-        if capturedSize == #body then
-            remaindBody = ""
-        elseif capturedSize == 0 then
-            remaindBody = body
+        if captured_size == #body then
+            remainder_body = ""
+        elseif captured_size == 0 then
+            remainder_body = body
         else
-            remaindBody = string.sub(body, capturedSize + 1)
+            remainder_body = string.sub(body, captured_size + 1)
         end
     end
     watch_resource(httpc, resource)
 end
 
+local function fetch_resource(resource)
+    while true do
+        local ok = false
+        local reason, message = "", ""
+        local retry_interval = 0
+        repeat
+            local httpc = http.new()
+            resource.watch_state = "connecting"
+            core.log.info("begin to connect ", apiserver_host, ":", apiserver_port)
+            ok, message = httpc:connect({
+                scheme = "https",
+                host = apiserver_host,
+                port = tonumber(apiserver_port),
+                ssl_verify = false
+            })
+            if not ok then
+                resource.watch_state = "connecting"
+                core.log.error("connect apiserver failed , apiserver_host: ", apiserver_host, "apiserver_port",
+                        apiserver_port, "message : ", message)
+                retry_interval = 100
+                break
+            end
+
+            core.log.info("begin to list ", resource.plural)
+            resource.watch_state = "listing"
+            resource:pre_list_callback()
+            ok, reason, message = list_resource(httpc, resource, nil)
+            if not ok then
+                resource.watch_state = "list failed"
+                core.log.error("list failed , resource: ", resource.plural, " reason: ", reason, "message : ", message)
+                retry_interval = 100
+                break
+            end
+            resource.watch_state = "list finished"
+            resource:post_list_callback()
+
+            core.log.info("begin to watch ", resource.plural)
+            resource.watch_state = "watching"
+            ok, reason, message = watch_resource(httpc, resource)
+            if not ok then
+                resource.watch_state = "watch failed"
+                core.log.error("watch failed, resource: ", resource.plural, " reason: ", reason, "message : ", message)
+                retry_interval = 0
+                break
+            end
+            resource.watch_state = "watch finished"
+            retry_interval = 0
+        until true
+        if retry_interval ~= 0 then
+            ngx.sleep(retry_interval)
+        end
+    end
+end
+
 local function fetch()
-    local resource = {
+    local threads = core.table.new(#watching_resources, 0)
+    for i, resource in ipairs(watching_resources) do
+        threads[i] = ngx.thread.spawn(fetch_resource, resource)
+    end
+    for _, thread in ipairs(threads) do
+        ngx.thread.wait(thread)
+    end
+end
+
+local function create_endpoint_lrucache(endpoint_key, endpoint_port)
+    local endpoint_content, _, _ = shared_endpoints:get_stale(endpoint_key)
+    if not endpoint_content then
+        core.log.emerg("get empty endpoint content from discovery DICT,this should not happen ", endpoint_key)
+        return nil
+    end
+
+    local endpoint, _ = core.json.decode(endpoint_content)
+    if not endpoint then
+        core.log.emerg("decode endpoint content failed, this should not happen, content : ", endpoint_content)
+    end
+
+    return endpoint[endpoint_port]
+end
+
+local _M = {
+    version = 0.01
+}
+
+function _M.nodes(service_name)
+    local pattern = "^(.*):(.*)$"
+    local match, _ = ngx.re.match(service_name, pattern, "jiao")
+    if not match then
+        core.log.info("get unexpected upstream service_name:　", service_name)
+        return nil
+    end
+
+    local endpoint_key = match[1]
+    local endpoint_port = match[2]
+    local endpoint_version, _, _ = shared_endpoints:get_stale(endpoint_key .. "#version")
+    if not endpoint_version then
+        core.log.info("get empty endpoint version from discovery DICT ", endpoint_key)
+        return nil
+    end
+    return endpoint_lrucache(service_name, endpoint_version, create_endpoint_lrucache, endpoint_key, endpoint_port)
+end
+
+function _M.init_worker()
+    if process.type() ~= "privileged agent" then
+        return
+    end
+
+    apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
+    --apiserver_host = "127.0.0.1"
+    if not apiserver_host or apiserver_host == "" then
+        end_world("get empty KUBERNETES_SERVICE_HOST value")
+    end
+
+    apiserver_port = os.getenv("KUBERNETES_SERVICE_PORT")
+    --apiserver_port = "8001"
+    if not apiserver_port or apiserver_port == "" then
+        end_world("get empty KUBERNETES_SERVICE_PORT value")
+    end
+
+    local err
+    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    if not token or token == "" then
+        end_world("get empty token value " .. (err or ""))
+        return
+    end
+
+    watching_resources = core.table.new(1, 0)
+
+    watching_resources[1] = {
+        group = "",
         version = "v1",
         kind = "Endpoints",
         listKind = "EndpointsList",
         plural = "endpoints",
         max_resource_version = 0,
 
+        label_selector = function()
+            return ""
+        end,
+
         list_path = function(self)
-            return string.format("/api/v1/endpoints", namespace)
+            return "/api/v1/endpoints"
         end,
 
         list_query = function(self, continue)
@@ -292,7 +416,7 @@ local function fetch()
         end,
 
         watch_path = function(self)
-            return string.format("/api/v1/namespaces/%s/endpoints", namespace)
+            return "/api/v1/endpoints"
         end,
 
         watch_query = function(self, timeout)
@@ -319,124 +443,37 @@ local function fetch()
 
         deleted_callback = function(self, object)
             on_endpoint_deleted(object)
-        end
+        end,
+
+        event_dispatch = function(self, event, object, drive)
+            if event == "BOOKMARK" then
+                -- do nothing because we had record max_resource_version to resource.max_resource_version
+                return
+            end
+
+            if drive == "watch" then
+                local resource_version = object.metadata.resourceVersion
+                local rvv = tonumber(resource_version)
+                if rvv <= self.max_resource_version then
+                    return
+                end
+                self.max_resource_version = rvv
+            end
+
+            if event == "DELETED" or object.deletionTimestamp ~= nil then
+                self:deleted_callback(object)
+                return
+            end
+
+            if event == "ADDED" then
+                self:added_callback(object, drive)
+            elseif event == "MODIFIED" then
+                self:modified_callback(object)
+            end
+        end,
     }
 
-    while true do
-        local ok = false
-        local reason, message = "", ""
-        local intervalTime = 0
-        repeat
-            local httpc = http.new()
-            resource.watch_state = "connecting"
-            core.log.info("begin to connect ", resource.plural)
-            ok, message = httpc:connect({
-                scheme = "https",
-                host = apiserver_host,
-                port = tonumber(apiserver_port),
-                ssl_verify = false
-            })
-            if not ok then
-                resource.watch_state = "connecting"
-                core.log.error("connect apiserver failed , apiserver_host: ", apiserver_host, "apiserver_port",
-                        apiserver_port, "message : ", message)
-                intervalTime = 200
-                break
-            end
-
-            core.log.info("begin to list ", resource.plural)
-            resource.watch_state = "listing"
-            resource:pre_list_callback()
-            ok, reason, message = list_resource(httpc, resource)
-            if not ok then
-                resource.watch_state = "listing failed"
-                core.log.error("list failed , resource: ", resource.plural, " reason: ", reason, "message : ", message)
-                intervalTime = 200
-                break
-            end
-            resource.watch_state = "list finished"
-            resource:post_list_callback()
-
-            core.log.info("begin to watch ", resource.plural)
-            resource.watch_state = "watching"
-            ok, reason, message = watch_resource(httpc, resource)
-            if not ok then
-                resource.watch_state = "watch failed"
-                core.log.error("watch failed, resource: ", resource.plural, " reason: ", reason, "message : ", message)
-                intervalTime = 100
-                break
-            end
-            resource.watch_state = "watch finished"
-            intervalTime = 0
-        until true
-        ngx.sleep(intervalTime)
-    end
-end
-
-local function create_lrucache(endpoint_key, endpoint_port)
-    local endpoint, _, _ = shared_endpoints:get_stale(endpoint_key)
-    if not endpoint then
-        core.log.error("get emppty endpoint from discovery DICT,this should not happen ", endpoint_key)
-        return nil
-    end
-
-    local t, _ = core.json.decode(endpoint)
-    if not t then
-        core.log.error("decode endpoint failed, this should not happen, content : ", endpoint)
-    end
-    return t[endpoint_port]
-end
-
-local _M = {
-    version = 0.01
-}
-
-function _M.nodes(service_name)
-    local pattern = "^(.*):(.*)$"
-    local match, _ = ngx.re.match(service_name, pattern, "jiao")
-    if not match then
-        core.log.info("get ｕnexpected upstream service_name:　", service_name)
-        return nil
-    end
-    local endpoint_key = match[1]
-    local endpoins_port = match[2]
-    local version, _, _ = shared_endpoints:get_stale(endpoint_key .. "#version")
-    if not version then
-        core.log.info("get emppty endpoint version from discovery DICT ", endpoint_key)
-        return nil
-    end
-    return lrucache(service_name, version, create_lrucache, endpoint_key, endpoins_port)
-end
-
-function _M.init_worker()
-    if process.type() ~= "privileged agent" then
-        return
-    end
-
-    local err
-    namespace, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
-    if not namespace or namespace == "" then
-        end_world("get empty namespace value " .. (err or ""))
-        return
-    end
-
-    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
-    if not token or token == "" then
-        end_world("get empty token value " .. (err or ""))
-        return
-    end
-
-    apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
-    if not apiserver_host or apiserver_host == "" then
-        end_world("get empty KUBERNETES_SERVICE_HOST value")
-    end
-
-    apiserver_port = os.getenv("KUBERNETES_SERVICE_PORT")
-    if not apiserver_port or apiserver_port == "" then
-        end_world("get empty KUBERNETES_SERVICE_PORT value")
-    end
-
-    ngx_timer_at(0, fetch)
+    ngx.timer.at(0, fetch)
 end
 
 return _M

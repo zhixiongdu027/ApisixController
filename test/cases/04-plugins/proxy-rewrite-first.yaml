@@ -5,7 +5,7 @@ metadata:
   namespace: test-apisix
   labels:
     apisix.apache.org/controller-by: default
-content:
+data:
   routes:
     - id: normal
       uris: [ "/first","/first/*" ]
@@ -18,4 +18,25 @@ content:
       type: roundrobin
       service_name: test-service:http
       discovery_type: k8s
+---
 
+apiVersion: apisix.apache.org/v1alpha1
+kind: Rule
+metadata:
+  name: test-route
+  namespace: test-apisix
+  labels:
+    apisix.apache.org/controller-by: default
+data:
+  routes:
+    - id: normal
+      uris: [ "/first","/first/*" ]
+      plugins:
+        proxy-rewrite:
+          regex_uri: [ "^/first(.*)"  , "/$1" ]
+      upstream_id: normal
+  upstreams:
+    - id: normal
+      type: roundrobin
+      service_name: test-service:http
+      discovery_type: k8s

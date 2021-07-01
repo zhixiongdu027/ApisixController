@@ -6,7 +6,6 @@ local string = string
 local tonumber = tonumber
 local math = math
 local os = os
-local ngx_timer_at = ngx.timer.at
 local process = require("ngx.process")
 local core = require("apisix.core")
 local util = require("apisix.cli.util")
@@ -22,71 +21,35 @@ local apiserver_port = ""
 local controller_name = ""
 
 local dump_cache = {}
+local dump_version = 0
+local fetch_version = 0
+
+local watching_resources
 
 local function end_world(reason)
     core.log.emerg(reason)
     signal.kill(process.get_master_pid(), signal.signum("QUIT"))
 end
 
-local function dump_yaml(resource)
-    -- todo delay 0.5 second to write
+local function dump()
+    if dump_version == fetch_version then
+        return
+    end
     core.table.clear(dump_cache)
-    resource:dump_callback(dump_cache)
+
+    for _, v in ipairs(watching_resources) do
+        v:dump_callback(dump_cache)
+    end
+
     local yaml = lyaml.dump({ dump_cache })
-    local file, err = open(apisix_yaml_path, "w+")
+    local file = open(apisix_yaml_path, "w+")
     if not file then
-        core.log.emerg("open file: ", apisix_yaml_path .. " failed , error info:" .. err)
+        core.log.emerg("open file: ", apisix_yaml_path .. " failed")
     end
     file:write(string.sub(yaml, 1, -5))
     file:write("#END")
     file:close()
-end
-
-local function event_dispatch(resource, event, object, drive)
-
-    if event == "BOOKMARK" then
-        -- do nothing because we had record max_resource_version to resource.max_resource_version
-        return
-    end
-
-    if drive == "watch" then
-        local resource_version = object.metadata.resourceVersion
-        local rvv = tonumber(resource_version)
-        if rvv <= resource.max_resource_version then
-            return
-        end
-        resource.max_resource_version = rvv
-    end
-
-    if (object.content.routes) then
-        for _, v in ipairs(object.content.routes) do
-            if not v.labels then
-                v.labels = { namespace = object.metadata.namespace }
-            else
-                v.labels.namespace = object.metadata.namespace
-            end
-        end
-    end
-
-    if (object.content.upstreams) then
-        for _, v in ipairs(object.content.upstreams) do
-            if v.service_name and v.discovery_type == "k8s" then
-                v.service_name = object.metadata.namespace .. "/" .. v.service_name
-            end
-        end
-    end
-
-    if event == "ADDED" then
-        resource:added_callback(object, drive)
-    elseif event == "MODIFIED" and object.deletionTimestamp == nil then
-        resource:modified_callback(object)
-    else
-        resource:deleted_callback(object)
-    end
-
-    if drive == "watch" then
-        dump_yaml(resource)
-    end
+    dump_version = fetch_version
 end
 
 local function list_resource(httpc, resource, continue)
@@ -104,7 +67,7 @@ local function list_resource(httpc, resource, continue)
     end
 
     if res.status ~= 200 then
-        return false, res.reason, res.read_body() or ""
+        return false, res.reason, res:read_body() or ""
     end
 
     local body, err = res:read_body()
@@ -121,7 +84,7 @@ local function list_resource(httpc, resource, continue)
     resource.max_resource_version = tonumber(resource_version)
 
     for _, item in ipairs(data.items) do
-        event_dispatch(resource, "ADDED", item, "list")
+        resource:event_dispatch("ADDED", item, "list")
     end
 
     if data.metadata.continue ~= nil and data.metadata.continue ~= "" then
@@ -149,15 +112,15 @@ local function watch_resource(httpc, resource)
     end
 
     if res.status ~= 200 then
-        return false, res.reason, res.read_body and res.read_body()
+        return false, res.reason, res:read_body() or ""
     end
 
-    local remaindBody = ""
+    local remainder_body = ""
     local body = ""
     local reader = res.body_reader
-    local gmatchIterator;
+    local gmatch_iterator;
     local captures;
-    local capturedSize = 0
+    local captured_size = 0
     while true do
 
         body, err = reader()
@@ -169,44 +132,160 @@ local function watch_resource(httpc, resource)
             break
         end
 
-        if #remaindBody ~= 0 then
-            body = remaindBody .. body
+        if #remainder_body ~= 0 then
+            body = remainder_body .. body
         end
 
-        gmatchIterator, err = ngx.re.gmatch(body, "{\"type\":.*}\n", "jiao")
-        if not gmatchIterator then
+        gmatch_iterator, err = ngx.re.gmatch(body, "{\"type\":.*}\n", "jiao")
+        if not gmatch_iterator then
             return false, "GmatchError", err
         end
 
         while true do
-            captures, err = gmatchIterator()
+            captures, err = gmatch_iterator()
             if err then
                 return false, "GmatchError", err
             end
             if not captures then
                 break
             end
-            capturedSize = capturedSize + #captures[0]
+            captured_size = captured_size + #captures[0]
             local v, _ = core.json.decode(captures[0])
             if not v or not v.object or v.object.kind ~= resource.kind then
                 return false, "UnexpectedBody", captures[0]
             end
-            event_dispatch(resource, v.type, v.object, "watch")
+            resource:event_dispatch(v.type, v.object, "watch")
         end
 
-        if capturedSize == #body then
-            remaindBody = ""
-        elseif capturedSize == 0 then
-            remaindBody = body
+        if captured_size == #body then
+            remainder_body = ""
+        elseif captured_size == 0 then
+            remainder_body = body
         else
-            remaindBody = string.sub(body, capturedSize + 1)
+            remainder_body = string.sub(body, captured_size + 1)
         end
     end
     watch_resource(httpc, resource)
 end
 
+local function fetch_resource(resource)
+    while true do
+        local ok = false
+        local reason, message = "", ""
+        local retry_interval = 0
+        repeat
+            local httpc = http.new()
+            resource.watch_state = "connecting"
+            core.log.info("begin to connect ", apiserver_host, ":", apiserver_port)
+            ok, message = httpc:connect({
+                scheme = "https",
+                host = apiserver_host,
+                port = tonumber(apiserver_port),
+                ssl_verify = false
+            })
+            if not ok then
+                resource.watch_state = "connecting"
+                core.log.error("connect apiserver failed , apiserver_host: ", apiserver_host, "apiserver_port",
+                        apiserver_port, "message : ", message)
+                retry_interval = 100
+                break
+            end
+
+            core.log.info("begin to list ", resource.plural)
+            resource.watch_state = "listing"
+            resource:pre_list_callback()
+            ok, reason, message = list_resource(httpc, resource, nil)
+            if not ok then
+                resource.watch_state = "list failed"
+                core.log.error("list failed , resource: ", resource.plural, " reason: ", reason, "message : ", message)
+                retry_interval = 100
+                break
+            end
+            resource.watch_state = "list finished"
+            resource:post_list_callback()
+
+            core.log.info("begin to watch ", resource.plural)
+            resource.watch_state = "watching"
+            ok, reason, message = watch_resource(httpc, resource)
+            if not ok then
+                resource.watch_state = "watch failed"
+                core.log.error("watch failed, resource: ", resource.plural, " reason: ", reason, "message : ", message)
+                retry_interval = 0
+                break
+            end
+            resource.watch_state = "watch finished"
+            retry_interval = 0
+        until true
+        if retry_interval ~= 0 then
+            ngx.sleep(retry_interval)
+        end
+    end
+end
+
 local function fetch()
-    local resource = {
+    local threads = core.table.new(#watching_resources, 0)
+    for i, resource in ipairs(watching_resources) do
+        threads[i] = ngx.thread.spawn(fetch_resource, resource)
+    end
+    for _, thread in ipairs(threads) do
+        ngx.thread.wait(thread)
+    end
+end
+
+local plugin_name = "controller"
+local schema = {
+    type = "object",
+    properties = {},
+    additionalProperties = false
+}
+
+local _M = {
+    version = 0.1,
+    priority = 99,
+    name = plugin_name,
+    schema = schema
+}
+
+function _M.check_schema(conf)
+    return true
+end
+
+function _M.init()
+    if process.type() ~= "privileged agent" then
+        return
+    end
+
+    local local_conf = core.config.local_conf()
+
+    local controller_conf = core.table.try_read_attr(local_conf, "plugin_attr", "controller")
+    if controller_conf then
+        controller_name = controller_conf.name
+    end
+
+    if not controller_name or controller_name == "" then
+        end_world("get empty controller.name value")
+    end
+
+    apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
+    if not apiserver_host or apiserver_host == "" then
+        end_world("get empty KUBERNETES_SERVICE_HOST value")
+    end
+
+    apiserver_port = os.getenv("KUBERNETES_SERVICE_PORT")
+    if not apiserver_port or apiserver_port == "" then
+        end_world("get empty KUBERNETES_SERVICE_PORT value")
+    end
+
+    local err
+    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    if not token or token == "" then
+        end_world("get empty token value " .. (err or ""))
+        return
+    end
+
+    watching_resources = core.table.new(3, 0)
+
+    watching_resources[1] = {
         group = "apisix.apache.org",
         version = "v1alpha1",
         kind = "Rule",
@@ -218,9 +297,6 @@ local function fetch()
         watch_state = "uninitialized",
 
         label_selector = function()
-            if controller_name == "default" then
-                return "&labelSelector=apisix.apache.org%2Fcontroller-by+in+%28%2C" .. controller_name .. "%29"
-            end
             return "&labelSelector=apisix.apache.org%2Fcontroller-by%3D" .. controller_name
         end,
 
@@ -250,32 +326,100 @@ local function fetch()
 
         post_list_callback = function(self)
             self.storage, self.list_storage = self.list_storage, {}
-            dump_yaml(self)
+            fetch_version = fetch_version + 1
         end,
 
         added_callback = function(self, object, drive)
             if drive == "list" then
-                self.list_storage[object.metadata.name] = object.content
+                self.list_storage[object.metadata.namespace .. "/" .. object.metadata.name] = object.data
                 return
             end
-            self.storage[object.metadata.name] = object.content
+            self.storage[object.metadata.namespace .. "/" .. object.metadata.name] = object.data
         end,
 
         modified_callback = function(self, object)
-            self.storage[object.metadata.name] = object.content
+            self.storage[object.metadata.namespace .. "/" .. object.metadata.name] = object.data
         end,
 
         deleted_callback = function(self, object)
-            self.storage[object.metadata.name] = nil
+            self.storage[object.metadata.namespace .. "/" .. object.metadata.name] = nil
+        end,
+
+        event_dispatch = function(self, event, object, drive)
+            if event == "BOOKMARK" then
+                -- do nothing because we had record max_resource_version to resource.max_resource_version
+                return
+            end
+
+            if drive == "watch" then
+                local resource_version = object.metadata.resourceVersion
+                local rvv = tonumber(resource_version)
+                if rvv <= self.max_resource_version then
+                    return
+                end
+                self.max_resource_version = rvv
+            end
+
+            if event == "DELETED" or object.deletionTimestamp ~= nil then
+                self:deleted_callback(object)
+                fetch_version = fetch_version + 1
+                return
+            end
+
+            local id_suffix = object.metadata.namespace .. object.metadata.name
+            id_suffix = "-" .. ngx.crc32_short(id_suffix)
+            for _, item in ipairs(object.data) do
+                for _, v in ipairs(item) do
+                    if v.id then
+                        v.id = v.id .. id_suffix
+                    end
+                    if v.services_id then
+                        v.services_id = v.id .. id_suffix
+                    end
+                    if v.upstream_id then
+                        v.upstream_id = v.id .. id_suffix
+                    end
+                end
+            end
+
+            for _, item in ipairs({ "routes", 'stream_routes' }) do
+                if object.data[item] then
+                    for _, v in ipairs(object.data[item]) do
+                        if not v.labels then
+                            v.labels = { namespace = object.metadata.namespace }
+                        else
+                            v.labels.namespace = object.metadata.namespace
+                        end
+                    end
+                end
+            end
+
+            if (object.data.upstreams) then
+                for _, v in ipairs(object.data.upstreams) do
+                    if v.service_name and v.discovery_type == "k8s" then
+                        v.service_name = object.metadata.namespace .. "/" .. v.service_name
+                    end
+                end
+            end
+
+            if event == "ADDED" then
+                self:added_callback(object, drive)
+            elseif event == "MODIFIED" then
+                self:modified_callback(object)
+            end
+
+            if drive == "watch" then
+                fetch_version = fetch_version + 1
+            end
         end,
 
         dump_callback = function(self, t)
             for _, v1 in pairs(self.storage) do
                 for k2, v2 in pairs(v1) do
-                    for _, v3 in pairs(v2) do
-                        if t[k2] == nil then
-                            t[k2] = { v3 }
-                        else
+                    if t[k2] == nil then
+                        t[k2] = v2
+                    else
+                        for _, v3 in ipairs(v2) do
                             core.table.insert(t[k2], v3)
                         end
                     end
@@ -284,110 +428,220 @@ local function fetch()
         end
     }
 
-    while true do
-        local ok = false
-        local reason, message = "", ""
-        local intervalTime = 0
-        repeat
-            local httpc = http.new()
-            resource.watch_state = "connecting"
-            core.log.info("begin to connect ", resource.plural)
-            ok, message = httpc:connect({
-                scheme = "https",
-                host = apiserver_host,
-                port = tonumber(apiserver_port),
-                ssl_verify = false
-            })
-            if not ok then
-                resource.watch_state = "connecting"
-                core.log.error("connect apiserver failed , apiserver_host: ", apiserver_host, "apiserver_port",
-                        apiserver_port, "message : ", message)
-                intervalTime = 200
-                break
+    watching_resources[2] = {
+        group = "apisix.apache.org",
+        version = "v1alpha1",
+        kind = "Config",
+        listKind = "ConfigList",
+        plural = "configs",
+        storage = {},
+        list_storage = {},
+        max_resource_version = 0,
+        watch_state = "uninitialized",
+
+        label_selector = function()
+            return "&labelSelector=apisix.apache.org%2Fcontroller-by%3D" .. controller_name
+        end,
+
+        list_path = function(self)
+            return "/apis/apisix.apache.org/v1alpha1/configs"
+        end,
+
+        list_query = function(self, continue)
+            if continue == nil or continue == "" then
+                return "limit=30" .. self.label_selector()
+            else
+                return "limit=30&continue=" .. continue .. self.label_selector()
+            end
+        end,
+
+        watch_path = function(self)
+            return "/apis/apisix.apache.org/v1alpha1/configs"
+        end,
+
+        watch_query = function(self, timeout)
+            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout, self.max_resource_version) .. self.label_selector()
+        end,
+
+        pre_list_callback = function(self)
+            core.table.clear(self.list_storage)
+        end,
+
+        post_list_callback = function(self)
+            self.storage, self.list_storage = self.list_storage, {}
+            fetch_version = fetch_version + 1
+        end,
+
+        added_callback = function(self, object, drive)
+            if drive == "list" then
+                self.list_storage[object.metadata.name] = object.data
+                return
+            end
+            self.storage[object.metadata.name] = object.data
+        end,
+
+        modified_callback = function(self, object)
+            self.storage[object.metadata.name] = object.data
+        end,
+
+        deleted_callback = function(self, object)
+            self.storage[object.metadata.name] = nil
+        end,
+
+        event_dispatch = function(self, event, object, drive)
+            if event == "BOOKMARK" then
+                -- do nothing because we had record max_resource_version to resource.max_resource_version
+                return
             end
 
-            core.log.info("begin to list ", resource.plural)
-            resource.watch_state = "listing"
-            resource:pre_list_callback()
-            ok, reason, message = list_resource(httpc, resource)
-            if not ok then
-                resource.watch_state = "list failed"
-                core.log.error("list failed , resource: ", resource.plural, " reason: ", reason, "message : ", message)
-                intervalTime = 200
-                break
+            if drive == "watch" then
+                local resource_version = object.metadata.resourceVersion
+                local rvv = tonumber(resource_version)
+                if rvv <= self.max_resource_version then
+                    return
+                end
+                self.max_resource_version = rvv
             end
-            resource.watch_state = "list finished"
-            resource:post_list_callback()
 
-            core.log.info("begin to watch ", resource.plural)
-            resource.watch_state = "watching"
-            ok, reason, message = watch_resource(httpc, resource)
-            if not ok then
-                resource.watch_state = "watch failed"
-                core.log.error("watch failed, resource: ", resource.plural, " reason: ", reason, "message : ", message)
-                intervalTime = 100
-                break
+            if event == "DELETED" or object.deletionTimestamp ~= nil then
+                self:deleted_callback(object)
+                fetch_version = fetch_version + 1
+                return
             end
-            resource.watch_state = "watch finished"
-            intervalTime = 0
-        until true
-        ngx.sleep(intervalTime)
-    end
-end
 
-local plugin_name = "controller"
-local schema = {
-    type = "object",
-    properties = {},
-    additionalProperties = false
-}
+            if event == "ADDED" then
+                self:added_callback(object, drive)
+            elseif event == "MODIFIED" then
+                self:modified_callback(object)
+            end
 
-local _M = {
-    version = 0.1,
-    priority = 99,
-    name = plugin_name,
-    schema = schema
-}
+            if drive == "watch" then
+                fetch_version = fetch_version + 1
+            end
+        end,
 
-function _M.check_schema(conf)
-    return true
-end
+        dump_callback = function(self, t)
+            for _, v1 in pairs(self.storage) do
+                for k2, v2 in pairs(v1) do
+                    if t[k2] == nil then
+                        t[k2] = v2
+                    else
+                        for _, v3 in ipairs(v2) do
+                            core.table.insert(t[k2], v3)
+                        end
+                    end
+                end
+            end
+        end
+    }
 
-function _M.init()
-    if process.type() ~= "privileged agent" then
-        return
-    end
+    watching_resources[3] = {
+        group = "apisix.apache.org",
+        version = "v1alpha1",
+        kind = "Cert",
+        listKind = "CertList",
+        plural = "certs",
+        storage = {},
+        list_storage = {},
+        max_resource_version = 0,
+        watch_state = "uninitialized",
 
-    local local_conf = core.config.local_conf()
+        label_selector = function()
+            return ""
+        end,
 
-    local controller_conf = core.table.try_read_attr(local_conf, "plugin_attr",
-            "controller")
-    if controller_conf then
-        controller_name = controller_conf.name
-    end
+        list_path = function(self)
+            return "/apis/apisix.apache.org/v1alpha1/certs"
+        end,
 
-    if not controller_name or controller_name == "" then
-        end_world("get empty controller_name value")
-    end
+        list_query = function(self, continue)
+            if continue == nil or continue == "" then
+                return "limit=30" .. self.label_selector()
+            else
+                return "limit=30&continue=" .. continue .. self.label_selector()
+            end
+        end,
 
-    apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
-    if not apiserver_host or apiserver_host == "" then
-        end_world("get empty KUBERNETES_SERVICE_HOST value")
-    end
+        watch_path = function(self)
+            return "/apis/apisix.apache.org/v1alpha1/certs"
+        end,
 
-    apiserver_port = os.getenv("KUBERNETES_SERVICE_PORT")
-    if not apiserver_port or apiserver_port == "" then
-        end_world("get empty KUBERNETES_SERVICE_PORT value")
-    end
+        watch_query = function(self, timeout)
+            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout, self.max_resource_version) .. self.label_selector()
+        end,
 
-    local err
-    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
-    if not token or token == "" then
-        end_world("get empty token value " .. (err or ""))
-        return
-    end
+        pre_list_callback = function(self)
+            core.table.clear(self.list_storage)
+        end,
 
-    ngx_timer_at(0, fetch)
+        post_list_callback = function(self)
+            self.storage, self.list_storage = self.list_storage, {}
+            fetch_version = fetch_version + 1
+        end,
+
+        added_callback = function(self, object, drive)
+            if drive == "list" then
+                self.list_storage[object.metadata.name] = object.data
+                return
+            end
+            self.storage[object.metadata.name] = object.data
+        end,
+
+        modified_callback = function(self, object)
+            self.storage[object.metadata.name] = object.data
+        end,
+
+        deleted_callback = function(self, object)
+            self.storage[object.metadata.name] = nil
+        end,
+
+        event_dispatch = function(self, event, object, drive)
+            if event == "BOOKMARK" then
+                -- do nothing because we had record max_resource_version to resource.max_resource_version
+                return
+            end
+
+            if drive == "watch" then
+                local resource_version = object.metadata.resourceVersion
+                local rvv = tonumber(resource_version)
+                if rvv <= self.max_resource_version then
+                    return
+                end
+                self.max_resource_version = rvv
+            end
+
+            if event == "DELETED" or object.deletionTimestamp ~= nil then
+                self:deleted_callback(object)
+                fetch_version = fetch_version + 1
+                return
+            end
+
+            if event == "ADDED" then
+                self:added_callback(object, drive)
+            elseif event == "MODIFIED" then
+                self:modified_callback(object)
+            end
+
+            if drive == "watch" then
+                fetch_version = fetch_version + 1
+            end
+        end,
+
+        dump_callback = function(self, t)
+            for _, v1 in pairs(self.storage) do
+                for _, v2 in pairs(v1) do
+                    if t.ssl == nil then
+                        t.ssl = { v2 }
+                    else
+                        core.table.insert(t.ssl, v2)
+                    end
+                end
+            end
+        end
+    }
+
+    ngx.timer.at(0, fetch)
+    ngx.timer.every(1.1, dump)
 end
 
 return _M

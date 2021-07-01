@@ -1,10 +1,9 @@
 #!/bin/bash
-#!/bin/bash
 
 SCRIPT_DIR="$(dirname "$BASH_SOURCE")"
 
 TEST_NAME_SPACE=test-apisix
-TEST_HTTP_PORT=3980
+TEST_HTTP_PORT=39080
 TEST_HTTPS_PORT=39443
 
 APISIX_CONTROLLER_IP=$(kubectl get nodes -o wide | grep minikube | awk '{print $6}')

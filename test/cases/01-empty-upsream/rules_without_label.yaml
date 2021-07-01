@@ -3,7 +3,7 @@ kind: Rule
 metadata:
   name: test-route
   namespace: test-apisix
-content:
+data:
   routes:
     - id: emptyupstream
       uris: [ "/emptyupstream","/emptyupstream/*" ]

@@ -5,7 +5,7 @@ metadata:
   namespace: test-apisix
   labels:
     apisix.apache.org/controller-by: default
-content:
+data:
   routes:
     - id: normal
       uris: [ /normal* ]

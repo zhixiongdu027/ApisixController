@@ -1,8 +1,5 @@
 # Configuration File - Apisix Config File
 # Modify it may be cause
-apisix:
-  config_center: yaml
-  enable_admin: false
 nginx_config:
   error_log_level: "info"
   http_configuration_snippet: |
@@ -22,7 +19,7 @@ nginx_config:
 
              lua_need_request_body on;
 
-             location = /validating/apisix.apache.org/rules/v1alpha1 {
+             location ^~ /validating/apisix.apache.org/ {
                  content_by_lua_block {
                      local webhook = require("apisix.plugins.webhook")
                      webhook.validating()

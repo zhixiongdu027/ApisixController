@@ -2,7 +2,7 @@
 
 set -ex
 
-[[ "$(kubectl apply -f "${CASE_PATH}"/not_exist_rules.yaml 2>&1)" =~ "denied the request:" ]]
+[[ "$(kubectl apply -f "${CASE_PATH}"/not_exist_plugin.yaml 2>&1)" =~ "denied the request:" ]]
 
 [[ "$(kubectl apply -f "${CASE_PATH}"/vaild_failed.yaml 2>&1)" =~ "denied the request:" ]]
 
@@ -10,6 +10,7 @@ set -ex
 sleep 3s
 
 [[ "$(curl -sw '%{http_code}' -o /dev/null http://"${APISIX_CONTROLLER_HTTP_ADDRESS}"/first)" == 200 ]]
+[[ "$(curl -sw '%{http_code}' -o /dev/null http://"${APISIX_CONTROLLER_HTTP_ADDRESS}"/first/)" == 200 ]]
 [[ "$(curl -sw '%{http_code}' -o /dev/null http://"${APISIX_CONTROLLER_HTTP_ADDRESS}"/first/xxx)" == 200 ]]
 [[ "$(curl -sw '%{http_code}' -o /dev/null http://"${APISIX_CONTROLLER_HTTP_ADDRESS}"/firstxxx)" == 404 ]]
 
