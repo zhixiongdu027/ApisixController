@@ -1,4 +1,4 @@
-#Apisix controller http listen port
+#Apisix controller name#
 name: default
 #---------------------------------
 
@@ -6,41 +6,45 @@ name: default
 httpPort: 9080
 #---------------------------------
 
-#Apisix controller http listen port
-httpsPort: 9443 #Apisix controller https listen port
+#Apisix controller https listen port
+httpsPort: 9443
 #---------------------------------
 
-#Apisix controller https listen port
+#Apisix controller tcp listen ports
 tcpPorts:
   - port: 8888
+#    tls: true
+#  - port: 8888
 #    tls: true
 #  - port: 8889
 #    hostPort: 9973
 #    tls: false
 #---------------------------------
 
-#Apisix controller https listen port
+#How Apisix controller expose
 # enum [ LoadBalancer | HostPort | HostNetwork ]
 exposeMode: HostPort
 #---------------------------------
 
-#Apisix controller https listen port
+#Apisix controller worker process
 workerProcesses: 1
 #---------------------------------
 
 replicas: 1
 
-#Apisix controller https listen port
+#Apisix controller resources
 resources:
   requests:
     cpu: "1000m"
+  #    memory: "1000M"
   limits:
     cpu: "1000m"
+#    memory: "1000M"
 #---------------------------------
 
-# nodeMatchExpressions:
-#   - key: kubernetes.io/hostname
-#     operator: In
-#     values:
-#       - node-172.16.0.238
+#nodeMatchExpressions:
+#  - key: kubernetes.io/hostname
+#    operator: In
+#    values:
+#      - node8.67
 image: placehodler

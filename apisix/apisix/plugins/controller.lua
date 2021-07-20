@@ -1,6 +1,6 @@
+local ngx = ngx
 local ipairs = ipairs
 local pairs = pairs
-local ngx = ngx
 local open = io.open
 local string = string
 local tonumber = tonumber
@@ -25,6 +25,8 @@ local dump_version = 0
 local fetch_version = 0
 
 local watching_resources
+
+local empty_table
 
 local function end_world(reason)
     core.log.emerg(reason)
@@ -367,38 +369,43 @@ function _M.init()
             end
 
             local id_suffix = object.metadata.namespace .. object.metadata.name
-            id_suffix = "-" .. ngx.crc32_short(id_suffix)
-            for _, item in ipairs(object.data) do
-                for _, v in ipairs(item) do
-                    if v.id then
-                        v.id = v.id .. id_suffix
-                    end
-                    if v.services_id then
-                        v.services_id = v.id .. id_suffix
-                    end
-                    if v.upstream_id then
-                        v.upstream_id = v.id .. id_suffix
-                    end
+            id_suffix = "_" .. ngx.crc32_short(id_suffix)
+
+            for _, upstream in ipairs(object.data.upstreams or empty_table) do
+                upstream.id = upstream.id .. id_suffix
+                if upstream.service_name and upstream.discovery_type == "k8s" then
+                    upstream.service_name = object.metadata.namespace .. "/" .. upstream.service_name
                 end
             end
 
-            for _, item in ipairs({ "routes", 'stream_routes' }) do
-                if object.data[item] then
-                    for _, v in ipairs(object.data[item]) do
-                        if not v.labels then
-                            v.labels = { namespace = object.metadata.namespace }
-                        else
-                            v.labels.namespace = object.metadata.namespace
-                        end
-                    end
+            for _, service in ipairs(object.data.services or empty_table) do
+                service.id = service.id .. id_suffix
+                if service.upstream_id then
+                    service.upstream_id = service.upstream_id .. id_suffix
                 end
             end
 
-            if (object.data.upstreams) then
-                for _, v in ipairs(object.data.upstreams) do
-                    if v.service_name and v.discovery_type == "k8s" then
-                        v.service_name = object.metadata.namespace .. "/" .. v.service_name
-                    end
+            for _, route in ipairs(object.data.routes or empty_table) do
+                route.id = route.id .. id_suffix
+                if route.upstream_id then
+                    route.upstream_id = route.upstream_id .. id_suffix
+                end
+                if not route.labels then
+                    route.labels = { namespace = object.metadata.namespace }
+                else
+                    route.labels.namespace = object.metadata.namespace
+                end
+            end
+
+            for _, stream_route in ipairs(object.data.stream_routes or empty_table) do
+                stream_route.id = stream_route.id .. id_suffix
+                if stream_route.upstream_id then
+                    stream_route.upstream_id = object.upstream_id .. id_suffix
+                end
+                if not stream_route.labels then
+                    stream_route.labels = { namespace = object.metadata.namespace }
+                else
+                    stream_route.labels.namespace = object.metadata.namespace
                 end
             end
 
@@ -416,12 +423,11 @@ function _M.init()
         dump_callback = function(self, t)
             for _, v1 in pairs(self.storage) do
                 for k2, v2 in pairs(v1) do
-                    if t[k2] == nil then
-                        t[k2] = v2
-                    else
-                        for _, v3 in ipairs(v2) do
-                            core.table.insert(t[k2], v3)
-                        end
+                    if not t[k2] then
+                        t[k2] = core.table.new(#v2 + 10, 0)
+                    end
+                    for _, v3 in ipairs(v2) do
+                        core.table.insert(t[k2], v3)
                     end
                 end
             end
@@ -523,12 +529,11 @@ function _M.init()
         dump_callback = function(self, t)
             for _, v1 in pairs(self.storage) do
                 for k2, v2 in pairs(v1) do
-                    if t[k2] == nil then
-                        t[k2] = v2
-                    else
-                        for _, v3 in ipairs(v2) do
-                            core.table.insert(t[k2], v3)
-                        end
+                    if not t[k2] then
+                        t[k2] = core.table.new(#v2 + 10, 0)
+                    end
+                    for _, v3 in ipairs(v2) do
+                        core.table.insert(t[k2], v3)
                     end
                 end
             end
@@ -639,6 +644,8 @@ function _M.init()
             end
         end
     }
+
+    empty_table = {}
 
     ngx.timer.at(0, fetch)
     ngx.timer.every(1.1, dump)

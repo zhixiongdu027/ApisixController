@@ -167,10 +167,12 @@ spec:
               hostPort: {{.hostPort | default .port}}
               name: p{{.port}}-{{.hostPort |default .port}}
               protocol: TCP
+          {{- end}}
+          {{- end}}
+          {{- end }}
+          {{- if .Values.resources}}
+          resources:  {{- toYaml .Values.resources | nindent 12 }}
   {{- end}}
-  {{- end}}
-  {{- end }}
-
 ---
 apiVersion: apisix.apache.org/v1alpha1
 kind: Config
@@ -179,7 +181,7 @@ metadata:
   labels:
     apisix.apache.org/controller-by: {{.Values.name}}
 data:
-  #global_rules: [ ]
+  global_rules: [ ]
   #plugins: [ ]
   #plugin_metadata: [ ]
   #consumers: [ ]
@@ -485,7 +487,7 @@ data:
       - redirect                       # priority: 900
       - response-rewrite               # priority: 899
       #- dubbo-proxy                   # priority: 507
-      - grpc-transcode                 # priority: 506
+      #- grpc-transcode                 # priority: 506
       - prometheus                     # priority: 500
       - echo                           # priority: 412
       - http-logger                    # priority: 410

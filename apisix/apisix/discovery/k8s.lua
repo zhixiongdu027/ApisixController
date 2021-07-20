@@ -1,5 +1,5 @@
-local ipairs = ipairs
 local ngx = ngx
+local ipairs = ipairs
 local string = string
 local tonumber = tonumber
 local tostring = tostring
@@ -23,7 +23,7 @@ local endpoint_lrucache = core.lrucache.new({
     count = 1024
 })
 
-local endpoint_buff = {}
+local endpoint_cache = {}
 
 local watching_resources
 
@@ -34,59 +34,6 @@ end
 
 local function sort_by_key_host(a, b)
     return a.host < b.host
-end
-
-local function on_endpoint_added(endpoint)
-    local subsets = endpoint.subsets
-    if subsets == nil or #subsets == 0 then
-        return
-    end
-
-    local subset = subsets[1]
-
-    local addresses = subset.addresses
-    if addresses == nil or #addresses == 0 then
-        return
-    end
-
-    local ports = subset.ports
-    if ports == nil or #ports == 0 then
-        return
-    end
-
-    core.table.clear(endpoint_buff)
-    for _, port in ipairs(ports) do
-        local nodes = core.table.new(#addresses, 0)
-        for i, address in ipairs(addresses) do
-            nodes[i] = {
-                host = address.ip,
-                port = port.port,
-                weight = default_weight
-            }
-        end
-        core.table.sort(nodes, sort_by_key_host)
-        if port.name then
-            endpoint_buff[port.name] = nodes
-        else
-            endpoint_buff[tostring(port.port)] = nodes
-        end
-    end
-
-    local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
-    local endpoint_content = core.json.encode(endpoint_buff, true)
-    local endpoint_version = ngx.crc32_long(endpoint_content)
-
-    local _, err
-    _, err = shared_endpoints:safe_set(endpoint_key .. "#version", endpoint_version)
-    if err then
-        core.log.emerg("set endpoint version into discovery DICT failed ,", err)
-        return
-    end
-    shared_endpoints:safe_set(endpoint_key, endpoint_content)
-    if err then
-        core.log.emerg("set endpoint into discovery DICT failed ,", err)
-        shared_endpoints:delete(endpoint_key .. "#version")
-    end
 end
 
 local function on_endpoint_deleted(endpoint)
@@ -113,7 +60,7 @@ local function on_endpoint_modified(endpoint)
         return on_endpoint_deleted(endpoint)
     end
 
-    core.table.clear(endpoint_buff)
+    core.table.clear(endpoint_cache)
     for _, port in ipairs(ports) do
         local nodes = core.table.new(#addresses, 0)
         for i, address in ipairs(addresses) do
@@ -124,15 +71,12 @@ local function on_endpoint_modified(endpoint)
             }
         end
         core.table.sort(nodes, sort_by_key_host)
-        if port.name then
-            endpoint_buff[port.name] = nodes
-        else
-            endpoint_buff[tostring(port.port)] = nodes
-        end
+        local port_name = port.name or tostring(port.port)
+        endpoint_cache[port_name] = nodes
     end
 
     local endpoint_key = endpoint.metadata.namespace .. "/" .. endpoint.metadata.name
-    local endpoint_content = core.json.encode(endpoint_buff, true)
+    local endpoint_content = core.json.encode(endpoint_cache, true)
     local endpoint_version = ngx.crc32_long(endpoint_content)
 
     local _, err
@@ -146,6 +90,10 @@ local function on_endpoint_modified(endpoint)
         core.log.emerg("set endpoint into discovery DICT failed ,", err)
         shared_endpoints:delete(endpoint_key .. "#version")
     end
+end
+
+local function on_endpoint_added(endpoint)
+    return on_endpoint_deleted(endpoint)
 end
 
 local function list_resource(httpc, resource, continue)
@@ -191,7 +139,7 @@ local function list_resource(httpc, resource, continue)
 end
 
 local function watch_resource(httpc, resource)
-    math.randomseed(process.get_master_pid())
+    math.randomseed(process.get_master_pid()) --todo change seed
     local watch_seconds = 1800 + math.random(60, 1200)
     local allowance_seconds = 120
     httpc:set_timeouts(2000, 3000, (watch_seconds + allowance_seconds) * 1000)

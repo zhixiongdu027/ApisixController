@@ -1,6 +1,6 @@
 {{- $ca := genCA "apisix-controller-ca" 365 }}
-  {{- $generate := printf "%s-apisix-controller.%s.svc" .Values.name .Release.Namespace }}
-  {{- $cert := genSignedCert $generate nil (list $generate) 365 $ca }}
+{{- $generate := printf "%s-apisix-controller.%s.svc" .Values.name .Release.Namespace }}
+{{- $cert := genSignedCert $generate nil (list $generate) 365 $ca }}
 ---
 apiVersion: v1
 kind: Secret

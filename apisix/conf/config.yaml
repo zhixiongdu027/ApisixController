@@ -1,7 +1,6 @@
-# Configuration File - Apisix Config File
-# Modify it may be cause
+# apisix start config ile - Apisix Config File
 nginx_config:
-  error_log_level: "info"
+  error_log_level: "warn"
   http_configuration_snippet: |
     ##### do not edit this section, unless you know what you're doing #####
      server {
@@ -16,8 +15,6 @@ nginx_config:
              ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
              ssl_prefer_server_ciphers on;
              ssl_session_tickets off;
-
-             lua_need_request_body on;
 
              location ^~ /validating/apisix.apache.org/ {
                  content_by_lua_block {

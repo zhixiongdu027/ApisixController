@@ -42,7 +42,13 @@ local function check_plugins(plugins, subsystem)
     for k, v in pairs(plugins) do
         ok, p = pcall(require, plugin_path .. k)
         if not ok then
+            core.log.error("require false , ", p or " ")
             return false, "not found plugin " .. k
+        end
+
+        if type(p) ~= "table" then
+            core.log.error("require false , ", p)
+            return false, "bad plugin " .. k
         end
 
         if type(p.check_schema) ~= "function" then
@@ -105,7 +111,6 @@ local function validating_rule(rule)
                 return false, "service_id : " .. route.service_id .. "not exist"
             end
         end
-
     end
 
     for _, stream_route in ipairs(rule.data.stream_routes or empty_table) do
