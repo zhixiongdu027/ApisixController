@@ -10,12 +10,11 @@ local process = require("ngx.process")
 local core = require("apisix.core")
 local util = require("apisix.cli.util")
 local http = require("resty.http")
-local signal = require("resty.signal")
 local profile = require("apisix.core.profile")
 local apisix_yaml_path = profile:yaml_path("apisix")
 local lyaml = require "lyaml"
 
-local token = ""
+local apiserver_token = ""
 local apiserver_host = ""
 local apiserver_port = ""
 local controller_name = ""
@@ -24,14 +23,9 @@ local dump_cache = {}
 local dump_version = 0
 local fetch_version = 0
 
-local watching_resources
+local pending_resources
 
-local empty_table
-
-local function end_world(reason)
-    core.log.emerg(reason)
-    signal.kill(process.get_master_pid(), signal.signum("QUIT"))
-end
+local empty_table = {}
 
 local function dump()
     if dump_version == fetch_version then
@@ -39,7 +33,7 @@ local function dump()
     end
     core.table.clear(dump_cache)
 
-    for _, v in ipairs(watching_resources) do
+    for _, v in ipairs(pending_resources) do
         v:dump_callback(dump_cache)
     end
 
@@ -60,7 +54,10 @@ local function list_resource(httpc, resource, continue)
         path = resource:list_path(),
         query = resource:list_query(continue),
         headers = {
-            ["Authorization"] = string.format("Bearer %s", token)
+            ["Host"] = string.format("%s:%s", apiserver_host, apiserver_port),
+            ["Authorization"] = string.format("Bearer %s", apiserver_token),
+            ["Accept"] = "application/json",
+            ["Connection"] = "keep-alive"
         }
     })
 
@@ -82,10 +79,9 @@ local function list_resource(httpc, resource, continue)
         return false, "UnexpectedBody", body
     end
 
-    local resource_version = data.metadata.resourceVersion
-    resource.max_resource_version = tonumber(resource_version)
+    resource.newest_resource_version = data.metadata.resourceVersion
 
-    for _, item in ipairs(data.items) do
+    for _, item in ipairs(data.items or empty_table) do
         resource:event_dispatch("ADDED", item, "list")
     end
 
@@ -105,7 +101,10 @@ local function watch_resource(httpc, resource)
         path = resource:watch_path(),
         query = resource:watch_query(watch_seconds),
         headers = {
-            ["Authorization"] = string.format("Bearer %s", token)
+            ["Host"] = string.format("%s:%s", apiserver_host, apiserver_port),
+            ["Authorization"] = string.format("Bearer %s", apiserver_token),
+            ["Accept"] = "application/json",
+            ["Connection"] = "keep-alive"
         }
     })
 
@@ -156,7 +155,11 @@ local function watch_resource(httpc, resource)
             if not v or not v.object or v.object.kind ~= resource.kind then
                 return false, "UnexpectedBody", captures[0]
             end
-            resource:event_dispatch(v.type, v.object, "watch")
+
+            resource.newest_resource_version = v.object.metadata.resource_version
+            if v.type ~= "BOOKMARK" then
+                resource:event_dispatch(v.type, v.object, "watch")
+            end
         end
 
         if captured_size == #body then
@@ -171,6 +174,7 @@ local function watch_resource(httpc, resource)
 end
 
 local function fetch_resource(resource)
+    local begin_time = ngx.time()
     while true do
         local ok = false
         local reason, message = "", ""
@@ -218,23 +222,24 @@ local function fetch_resource(resource)
             resource.watch_state = "watch finished"
             retry_interval = 0
         until true
+
+        -- every 3 hours,we should quit and use another timer
+        local now_time = ngx.time()
+        if now_time - begin_time >= 10800 then
+            break
+        end
         if retry_interval ~= 0 then
             ngx.sleep(retry_interval)
         end
     end
-end
-
-local function fetch()
-    local threads = core.table.new(#watching_resources, 0)
-    for i, resource in ipairs(watching_resources) do
-        threads[i] = ngx.thread.spawn(fetch_resource, resource)
+    local runner = function()
+        fetch_resource(resource)
     end
-    for _, thread in ipairs(threads) do
-        ngx.thread.wait(thread)
-    end
+    ngx.timer.at(0, runner)
 end
 
 local plugin_name = "controller"
+
 local schema = {
     type = "object",
     properties = {},
@@ -252,42 +257,10 @@ function _M.check_schema(conf)
     return true
 end
 
-function _M.init()
-    if process.type() ~= "privileged agent" then
-        return
-    end
+local function fill_pending_resources()
+    pending_resources = core.table.new(3, 0)
 
-    local local_conf = core.config.local_conf()
-
-    local controller_conf = core.table.try_read_attr(local_conf, "plugin_attr", "controller")
-    if controller_conf then
-        controller_name = controller_conf.name
-    end
-
-    if not controller_name or controller_name == "" then
-        end_world("get empty controller.name value")
-    end
-
-    apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
-    if not apiserver_host or apiserver_host == "" then
-        end_world("get empty KUBERNETES_SERVICE_HOST value")
-    end
-
-    apiserver_port = os.getenv("KUBERNETES_SERVICE_PORT")
-    if not apiserver_port or apiserver_port == "" then
-        end_world("get empty KUBERNETES_SERVICE_PORT value")
-    end
-
-    local err
-    token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
-    if not token or token == "" then
-        end_world("get empty token value " .. (err or ""))
-        return
-    end
-
-    watching_resources = core.table.new(3, 0)
-
-    watching_resources[1] = {
+    pending_resources[1] = {
         group = "apisix.apache.org",
         version = "v1alpha1",
         kind = "Rule",
@@ -295,7 +268,7 @@ function _M.init()
         plural = "rules",
         storage = {},
         list_storage = {},
-        max_resource_version = 0,
+        newest_resource_version = "",
         watch_state = "uninitialized",
 
         label_selector = function()
@@ -319,10 +292,12 @@ function _M.init()
         end,
 
         watch_query = function(self, timeout)
-            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout, self.max_resource_version) .. self.label_selector()
+            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%s",
+                    timeout, self.newest_resource_version) .. self.label_selector()
         end,
 
         pre_list_callback = function(self)
+            self.newest_resource_version = "0"
             core.table.clear(self.list_storage)
         end,
 
@@ -348,20 +323,6 @@ function _M.init()
         end,
 
         event_dispatch = function(self, event, object, drive)
-            if event == "BOOKMARK" then
-                -- do nothing because we had record max_resource_version to resource.max_resource_version
-                return
-            end
-
-            if drive == "watch" then
-                local resource_version = object.metadata.resourceVersion
-                local rvv = tonumber(resource_version)
-                if rvv <= self.max_resource_version then
-                    return
-                end
-                self.max_resource_version = rvv
-            end
-
             if event == "DELETED" or object.deletionTimestamp ~= nil then
                 self:deleted_callback(object)
                 fetch_version = fetch_version + 1
@@ -434,7 +395,7 @@ function _M.init()
         end
     }
 
-    watching_resources[2] = {
+    pending_resources[2] = {
         group = "apisix.apache.org",
         version = "v1alpha1",
         kind = "Config",
@@ -442,7 +403,7 @@ function _M.init()
         plural = "configs",
         storage = {},
         list_storage = {},
-        max_resource_version = 0,
+        newest_resource_version = "0",
         watch_state = "uninitialized",
 
         label_selector = function()
@@ -466,10 +427,12 @@ function _M.init()
         end,
 
         watch_query = function(self, timeout)
-            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout, self.max_resource_version) .. self.label_selector()
+            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%s",
+                    timeout, self.newest_resource_version) .. self.label_selector()
         end,
 
         pre_list_callback = function(self)
+            self.newest_resource_version = "0"
             core.table.clear(self.list_storage)
         end,
 
@@ -495,19 +458,6 @@ function _M.init()
         end,
 
         event_dispatch = function(self, event, object, drive)
-            if event == "BOOKMARK" then
-                -- do nothing because we had record max_resource_version to resource.max_resource_version
-                return
-            end
-
-            if drive == "watch" then
-                local resource_version = object.metadata.resourceVersion
-                local rvv = tonumber(resource_version)
-                if rvv <= self.max_resource_version then
-                    return
-                end
-                self.max_resource_version = rvv
-            end
 
             if event == "DELETED" or object.deletionTimestamp ~= nil then
                 self:deleted_callback(object)
@@ -540,7 +490,7 @@ function _M.init()
         end
     }
 
-    watching_resources[3] = {
+    pending_resources[3] = {
         group = "apisix.apache.org",
         version = "v1alpha1",
         kind = "Cert",
@@ -548,7 +498,7 @@ function _M.init()
         plural = "certs",
         storage = {},
         list_storage = {},
-        max_resource_version = 0,
+        newest_resource_version = "0",
         watch_state = "uninitialized",
 
         label_selector = function()
@@ -572,10 +522,12 @@ function _M.init()
         end,
 
         watch_query = function(self, timeout)
-            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%d", timeout, self.max_resource_version) .. self.label_selector()
+            return string.format("watch=1&allowWatchBookmarks=true&timeoutSeconds=%d&resourceVersion=%s",
+                    timeout, self.newest_resource_version) .. self.label_selector()
         end,
 
         pre_list_callback = function(self)
+            self.newest_resource_version = "0"
             core.table.clear(self.list_storage)
         end,
 
@@ -601,19 +553,6 @@ function _M.init()
         end,
 
         event_dispatch = function(self, event, object, drive)
-            if event == "BOOKMARK" then
-                -- do nothing because we had record max_resource_version to resource.max_resource_version
-                return
-            end
-
-            if drive == "watch" then
-                local resource_version = object.metadata.resourceVersion
-                local rvv = tonumber(resource_version)
-                if rvv <= self.max_resource_version then
-                    return
-                end
-                self.max_resource_version = rvv
-            end
 
             if event == "DELETED" or object.deletionTimestamp ~= nil then
                 self:deleted_callback(object)
@@ -645,9 +584,50 @@ function _M.init()
         end
     }
 
-    empty_table = {}
+end
 
-    ngx.timer.at(0, fetch)
+function _M.init()
+    if process.type() ~= "privileged agent" then
+        return
+    end
+
+    local local_conf = core.config.local_conf()
+
+    local controller_conf = core.table.try_read_attr(local_conf, "plugin_attr", "controller")
+    if controller_conf then
+        controller_name = controller_conf.name
+    end
+
+    if not controller_name or controller_name == "" then
+        core.log.error("get empty controller.name value")
+    end
+
+    apiserver_host = os.getenv("KUBERNETES_SERVICE_HOST")
+
+    if not apiserver_host or apiserver_host == "" then
+        error("get empty KUBERNETES_SERVICE_HOST value")
+    end
+
+    apiserver_port = os.getenv("KUBERNETES_SERVICE_PORT")
+    if not apiserver_port or apiserver_port == "" then
+        error("get empty KUBERNETES_SERVICE_PORT value")
+    end
+
+    local err
+    apiserver_token, err = util.read_file("/var/run/secrets/kubernetes.io/serviceaccount/token")
+    if not apiserver_token or apiserver_token == "" then
+        error("get empty token value " .. (err or ""))
+        return
+    end
+
+    fill_pending_resources()
+    for _, resource in ipairs(pending_resources) do
+        local runner = function()
+            fetch_resource(resource)
+        end
+        ngx.timer.at(0, runner)
+    end
+
     ngx.timer.every(1.1, dump)
 end
 
